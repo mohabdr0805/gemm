@@ -1,6 +1,6 @@
-// GEMM tuilé sur GPU : C = alpha*A*B + beta*C, matrices row-major.
-// Un bloc 16x16 calcule une tuile de C ; A et B passent par la mémoire
-// partagée pour amortir les accès à la mémoire globale.
+// Tiled GEMM on the GPU: C = alpha*A*B + beta*C, row-major matrices.
+// A 16x16 block computes one tile of C; A and B are streamed through shared
+// memory to amortize global-memory traffic.
 #include "gemm/gemm_cuda.cuh"
 
 #include <cuda_runtime.h>
@@ -21,8 +21,8 @@
 
 namespace gemm {
 
-// As/Bs paddés à TILE+1 colonnes pour éviter les bank conflicts quand on lit
-// Bs en colonne dans la boucle d'accumulation.
+// As/Bs padded to TILE+1 columns to avoid bank conflicts when reading Bs
+// column-wise in the accumulation loop.
 __global__ void gemm_kernel(int M, int N, int K, float alpha,
                             const float* __restrict__ A,
                             const float* __restrict__ B,
@@ -32,16 +32,16 @@ __global__ void gemm_kernel(int M, int N, int K, float alpha,
 
     const int tx = threadIdx.x;
     const int ty = threadIdx.y;
-    const int row = blockIdx.y * TILE + ty;   // ligne de C
-    const int col = blockIdx.x * TILE + tx;   // colonne de C
+    const int row = blockIdx.y * TILE + ty;   // C row
+    const int col = blockIdx.x * TILE + tx;   // C column
 
     float acc = 0.0f;
     const int ntiles = (K + TILE - 1) / TILE;
     for (int t = 0; t < ntiles; ++t) {
-        const int ak = t * TILE + tx;   // colonne de A lue par ce thread
-        const int bk = t * TILE + ty;   // ligne de B lue par ce thread
+        const int ak = t * TILE + tx;   // column of A read by this thread
+        const int bk = t * TILE + ty;   // row of B read by this thread
 
-        // Chargements coalescés (tx contigu -> adresses contiguës), 0 hors bords.
+        // Coalesced loads (tx contiguous -> contiguous addresses); 0 out of bounds.
         As[ty][tx] = (row < M && ak < K) ? A[row * K + ak] : 0.0f;
         Bs[ty][tx] = (bk < K && col < N) ? B[bk * N + col] : 0.0f;
         __syncthreads();
@@ -54,7 +54,7 @@ __global__ void gemm_kernel(int M, int N, int K, float alpha,
 
     if (row < M && col < N) {
         const int idx = row * N + col;
-        C[idx] = alpha * acc + beta * C[idx];   // beta*C : on relit l'ancien C
+        C[idx] = alpha * acc + beta * C[idx];   // beta*C: we read the old C back
     }
 }
 
@@ -71,7 +71,7 @@ void gemm_cuda(int M, int N, int K, float alpha,
 
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice)); // pour le terme beta*C
+    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice)); // needed for the beta*C term
 
     dim3 block(TILE, TILE);
     dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);

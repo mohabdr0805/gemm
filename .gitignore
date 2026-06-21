@@ -9,7 +9,7 @@ CMakeFiles/
 *.cmake
 !CMakeLists.txt
 
-# Objets / binaires
+# Objects / binaries
 *.o
 *.obj
 *.exe
@@ -21,7 +21,7 @@ CMakeFiles/
 *.pdb
 *.ilk
 
-# IDE / outils
+# IDE / tools
 .vs/
 .vscode/
 .idea/
@@ -31,5 +31,5 @@ CMakeFiles/
 Thumbs.db
 .DS_Store
 
-# Doc interne de reprise (perso, hors repo public)
+# Personal handoff notes (kept out of the public repo)
 HANDOFF.md

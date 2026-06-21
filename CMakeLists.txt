@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(gemm_optim LANGUAGES CXX)
 
-option(USE_CUDA "Construire l'implémentation CUDA (nécessite un GPU NVIDIA + nvcc)" OFF)
+option(USE_CUDA "Build the CUDA implementation (requires an NVIDIA GPU + nvcc)" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,19 +16,19 @@ endif()
 
 find_package(OpenMP)
 
-# --- Bibliothèque CPU --------------------------------------------------------
+# --- CPU library -------------------------------------------------------------
 add_library(gemm_cpu src/gemm_cpu.cpp)
 target_include_directories(gemm_cpu PUBLIC include)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(gemm_cpu PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
-# --- Bibliothèque CUDA (optionnelle) -----------------------------------------
+# --- CUDA library (optional) -------------------------------------------------
 if(USE_CUDA)
   enable_language(CUDA)
   add_library(gemm_cuda src/gemm_cuda.cu)
   target_include_directories(gemm_cuda PUBLIC include)
-  # 75 = Turing (GTX 1650), 86 = Ampère (RTX 30xx)
+  # 75 = Turing (GTX 1650), 86 = Ampere (RTX 30xx)
   set_target_properties(gemm_cuda PROPERTIES CUDA_ARCHITECTURES "75;86")
 endif()
 
