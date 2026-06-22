@@ -1,5 +1,7 @@
 # gemm-optim
 
+![CI](https://github.com/MohaBdr0805/gemm/actions/workflows/ci.yml/badge.svg)
+
 Optimized **GEMM** (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, with performance
 analysis — from optimized CPU compute to **GPU kernels for neural-network
 inference**. Row-major matrices, single precision.
@@ -124,6 +126,32 @@ ctest --test-dir build --output-on-failure   # adds GPU v1/v2 + fused-epilogue c
 ```
 Target GPU architectures: `75;86` (Turing + Ampere), tunable in `CMakeLists.txt`.
 
+## Docker
+
+Reproducible builds, no local toolchain required.
+
+```bash
+# CPU image: builds, runs the correctness test, then the benchmark
+docker build -t gemm-cpu .
+docker run --rm gemm-cpu 2048
+
+# CUDA image: compiles the GPU kernels (running them needs an NVIDIA GPU)
+docker build -f Dockerfile.cuda -t gemm-cuda .
+docker run --rm --gpus all gemm-cuda 2048
+```
+
+Images are built portably (`-DGEMM_NATIVE=OFF`, no `-march=native`). The CPU image
+is published on each tagged release to `ghcr.io/mohabdr0805/gemm`.
+
+## CI / CD
+
+- **CI** (`.github/workflows/ci.yml`, every push/PR): builds and runs the CPU
+  tests, **compile-checks** the CUDA build, and builds the CPU Docker image. The
+  GitHub runners have no GPU, so the CUDA kernels are compiled but not executed.
+- **CD** (`.github/workflows/release.yml`, on a `v*` tag): builds the CPU image and
+  pushes it to GHCR. A library has no service to deploy — the delivered artifact is
+  the container image.
+
 ## Layout
 
 ```
@@ -139,6 +167,6 @@ tests/          correctness: tiled, CUDA v1/v2, and fused epilogue vs CPU oracle
 - [x] GPU v1: shared-memory tiled CUDA kernel
 - [x] GPU v2: register tiling (8×8 micro-block per thread) — 6.6× over v1
 - [x] Fused inference epilogue (GEMM + bias + activation)
-- [ ] Dockerfile (reproducible CPU + CUDA build)
-- [ ] GitHub Actions CI (build + CPU tests)
+- [x] Docker images (CPU + CUDA) + CI/CD (GitHub Actions, image published to GHCR)
+- [ ] Fused attention / softmax micro-kernel (FlashAttention-style)
 - [ ] Multi-device StarPU variant (CPU+GPU tasks)

@@ -1,0 +1,22 @@
+# CUDA build of gemm-optim (adds the GPU kernels v1/v2 + the fused epilogue).
+# Compiles the CUDA code; running the GPU tests/benchmark needs an NVIDIA GPU and
+# the NVIDIA Container Toolkit on the host:
+#   docker build -f Dockerfile.cuda -t gemm-cuda .
+#   docker run --rm --gpus all gemm-cuda 2048
+# Adjust the base tag to a CUDA "devel" image available for your toolkit version.
+FROM nvidia/cuda:12.6.2-devel-ubuntu24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+
+# Compile only (no ctest): the build host has no GPU. Run the tests at
+# `docker run --gpus all ...` time on a GPU machine.
+RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGEMM_NATIVE=OFF -DUSE_CUDA=ON \
+    && cmake --build build -j
+
+ENTRYPOINT ["/app/build/bench"]
+CMD ["2048"]

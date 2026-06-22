@@ -1,0 +1,8 @@
+.git/
+build/
+build_*/
+.github/
+.vs/
+.vscode/
+.idea/
+.claude/

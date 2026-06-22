@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  cpu:
+    name: CPU build + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  cuda-compile:
+    name: CUDA compile-check (no GPU on the runner)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '12.5.0'
+          method: network
+          sub-packages: '["nvcc"]'
+      - name: Install cmake/g++
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+      - name: Configure (USE_CUDA=ON)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON
+      - name: Build (compile only; runners have no GPU to run the tests)
+        run: cmake --build build -j
+
+  docker:
+    name: Docker image build (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CPU image
+        run: docker build -t gemm-cpu .
