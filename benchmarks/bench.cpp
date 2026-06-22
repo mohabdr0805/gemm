@@ -46,6 +46,10 @@ int main(int argc, char** argv) {
     double tc = seconds([&]{ gemm::gemm_cuda(n, n, n, alpha, A.data(), B.data(), beta, C.data()); });
     std::printf("cuda  : %8.3f s   %7.2f GFLOP/s\n", tc, flops / tc / 1e9); // includes H2D/D2H
 
+    // GEMM kernel v1 (shared-memory tiled) vs v2 (register tiled), device timing.
+    std::printf("\n[GEMM kernel v1 vs v2]  device timing (no transfers)\n");
+    gemm::benchmark_gemm_versions(n, n, n);
+
     // Fused inference epilogue: fusion vs two-pass (pure device timing, no transfers).
     // The gain grows as K shrinks (the saved epilogue pass is a bigger share) and
     // for smaller problems (launch overhead matters) -> a square GEMM shows ~1x.

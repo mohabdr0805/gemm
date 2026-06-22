@@ -7,9 +7,17 @@
 // (tests, bench) compiled by g++/cl, without nvcc.
 namespace gemm {
 
-// Base GEMM (shared-memory tiled kernel).
+// Base GEMM, v1 (shared-memory tiled kernel).
 void gemm_cuda(int M, int N, int K, float alpha,
                const float* A, const float* B, float beta, float* C);
+
+// GEMM v2 (register tiled): each thread computes an 8x8 micro-block of C in
+// registers -> higher arithmetic intensity. Same convention, same result.
+void gemm_cuda_reg(int M, int N, int K, float alpha,
+                   const float* A, const float* B, float beta, float* C);
+
+// Device-timed comparison of v1 (shared-memory tiled) vs v2 (register tiled).
+void benchmark_gemm_versions(int M, int N, int K);
 
 // Fused inference epilogue: C = act( alpha*A*B + beta*C + bias[col] ).
 // The bias add and the activation are computed in the GEMM kernel's epilogue ->

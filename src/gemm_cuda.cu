@@ -260,4 +260,154 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dbias);
 }
 
+// ---------------------------------------------------------------------------
+// Register-tiled GEMM (v2). Each thread computes a TM x TN micro-block of C
+// (8x8 = 64 outputs) kept in registers, instead of a single element. Each value
+// loaded from shared memory is reused TM (or TN) times -> much higher arithmetic
+// intensity, the main lever once occupancy is already saturated (see README).
+// Block tile BM x BN = 128 x 128, K stepped in chunks of BK = 8, 256 threads.
+// ---------------------------------------------------------------------------
+__global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
+                                const float* __restrict__ A,
+                                const float* __restrict__ B,
+                                float beta, float* __restrict__ C) {
+    constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+    constexpr int NT = (BM / TM) * (BN / TN); // threads per block = 256
+
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
+
+    const int blockRow = blockIdx.y * BM;
+    const int blockCol = blockIdx.x * BN;
+
+    const int tid = threadIdx.x;
+    const int threadCol = tid % (BN / TN);   // 0..15
+    const int threadRow = tid / (BN / TN);   // 0..15
+
+    float acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i)
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
+    float regM[TM], regN[TN];
+
+    // Cooperative-load indices (the NT threads fill the BM*BK and BK*BN tiles).
+    const int innerRowA = tid / BK, innerColA = tid % BK, strideA = NT / BK;
+    const int innerRowB = tid / BN, innerColB = tid % BN, strideB = NT / BN;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        #pragma unroll
+        for (int off = 0; off < BM; off += strideA) {
+            const int gRow = blockRow + innerRowA + off, gCol = k0 + innerColA;
+            As[(innerRowA + off) * BK + innerColA] =
+                (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+        }
+        #pragma unroll
+        for (int off = 0; off < BK; off += strideB) {
+            const int gRow = k0 + innerRowB + off, gCol = blockCol + innerColB;
+            Bs[(innerRowB + off) * BN + innerColB] =
+                (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+        }
+        __syncthreads();
+
+        // Each thread loads its TM-row and TN-col fragments once, reuses them
+        // across the TM x TN outer product -> TM*TN FMAs per TM+TN shared loads.
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) regM[i] = As[(threadRow * TM + i) * BK + kk];
+            #pragma unroll
+            for (int j = 0; j < TN; ++j) regN[j] = Bs[kk * BN + threadCol * TN + j];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] += regM[i] * regN[j];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gRow = blockRow + threadRow * TM + i;
+        if (gRow >= M) continue;
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int gCol = blockCol + threadCol * TN + j;
+            if (gCol >= N) continue;
+            const int idx = gRow * N + gCol;
+            C[idx] = alpha * acc[i][j] + beta * C[idx];
+        }
+    }
+}
+
+// Host wrapper: register-tiled GEMM (v2).
+void gemm_cuda_reg(int M, int N, int K, float alpha,
+                   const float* A, const float* B, float beta, float* C) {
+    const size_t sa = (size_t)M * K * sizeof(float);
+    const size_t sb = (size_t)K * N * sizeof(float);
+    const size_t sc = (size_t)M * N * sizeof(float);
+
+    float *dA, *dB, *dC;
+    CUDA_CHECK(cudaMalloc(&dA, sa));
+    CUDA_CHECK(cudaMalloc(&dB, sb));
+    CUDA_CHECK(cudaMalloc(&dC, sc));
+    CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
+
+    constexpr int BM = 128, BN = 128;
+    dim3 block(256);
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_reg_kernel<<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(C, dC, sc, cudaMemcpyDeviceToHost));
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+}
+
+// Benchmark: v1 (shared-memory tiled) vs v2 (register tiled). Device timing, no
+// transfers -> the pure kernel speedup that register tiling buys.
+void benchmark_gemm_versions(int M, int N, int K) {
+    const float alpha = 1.0f, beta = 0.0f;
+    const size_t sa = (size_t)M * K * sizeof(float);
+    const size_t sb = (size_t)K * N * sizeof(float);
+    const size_t sc = (size_t)M * N * sizeof(float);
+    float *dA, *dB, *dC;
+    CUDA_CHECK(cudaMalloc(&dA, sa));
+    CUDA_CHECK(cudaMalloc(&dB, sb));
+    CUDA_CHECK(cudaMalloc(&dC, sc));
+    CUDA_CHECK(cudaMemset(dA, 0, sa));
+    CUDA_CHECK(cudaMemset(dB, 0, sb));
+
+    dim3 b1(TILE, TILE), g1((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    constexpr int BM = 128, BN = 128;
+    dim3 b2(256), g2((N + BN - 1) / BN, (M + BM - 1) / BM);
+    auto run_v1 = [&]{ gemm_kernel<<<g1, b1>>>(M, N, K, alpha, dA, dB, beta, dC); };
+    auto run_v2 = [&]{ gemm_reg_kernel<<<g2, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
+
+    run_v1(); run_v2(); CUDA_CHECK(cudaDeviceSynchronize());
+
+    const int iters = 50;
+    cudaEvent_t s, e; float ms1 = 0.f, ms2 = 0.f;
+    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int i = 0; i < iters; ++i) run_v1();
+    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
+    CUDA_CHECK(cudaEventElapsedTime(&ms1, s, e));
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int i = 0; i < iters; ++i) run_v2();
+    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
+    CUDA_CHECK(cudaEventElapsedTime(&ms2, s, e));
+
+    const double gflop = 2.0 * M * N * K / 1e9;
+    const double t1 = ms1 / iters, t2 = ms2 / iters;
+    std::printf("  v1 shared-tiled : %7.3f ms/iter   %7.2f GFLOP/s\n", t1, gflop / (t1 / 1e3));
+    std::printf("  v2 register     : %7.3f ms/iter   %7.2f GFLOP/s\n", t2, gflop / (t2 / 1e3));
+    std::printf("  register-tiling speedup : %.2fx\n", t1 / t2);
+
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+}
+
 } // namespace gemm
