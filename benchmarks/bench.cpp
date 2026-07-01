@@ -1,6 +1,7 @@
 #include "gemm/gemm_cpu.hpp"
 #ifdef USE_CUDA
 #include "gemm/gemm_cuda.cuh"
+#include "gemm/softmax_cuda.cuh"
 #endif
 #include <vector>
 #include <functional>
@@ -59,6 +60,11 @@ int main(int argc, char** argv) {
         std::printf("M=%d N=%d K=%d:\n", s[0], s[1], s[2]);
         gemm::benchmark_fusion(s[0], s[1], s[2], gemm::Activation::GELU);
     }
+
+    // Softmax (row-wise): memory-bound, so the figure of merit is bandwidth.
+    std::printf("\n[Softmax row-wise]  device timing (no transfers)\n");
+    gemm::benchmark_softmax(n, n);
+    gemm::benchmark_softmax(n, 1024);
 #endif
 
     return 0;
