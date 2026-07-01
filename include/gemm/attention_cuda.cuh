@@ -28,14 +28,10 @@ void flash_attention_cuda(int M, int N, int d, float scale,
 // K/V tile, so K/V are read M/tile times, not M times (the arithmetic-intensity
 // lever -- same v1->v2 story as the GEMM kernels). Specialized for the common head
 // dims d in {32, 64, 128}; any other d transparently falls back to v1. Same result.
+// (d<=64 keeps the per-row state in registers; d=128 spills but still beats v1.)
 void flash_attention_cuda_v2(int M, int N, int d, float scale,
                              const float* Q, const float* K, const float* V,
                              float* O, bool causal);
-
-// Device-timed throughput (no host<->device transfers). Reports ms/iter and the
-// effective GFLOP/s -- attention is ~4*M*N*d flops (two matmuls of 2*M*N*d each),
-// and the causal mask touches about half of them.
-void benchmark_attention(int M, int N, int d, bool causal);
 
 // Device-timed v1 vs v2 (no transfers): the pure kernel speedup from query
 // tiling. Use a head dim d in {32, 64, 128} so v2 runs its specialized kernel.

@@ -159,44 +159,6 @@ void flash_attention_cuda(int M, int N, int d, float scale,
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
 }
 
-// Device timing only (no transfers). The N x N matrix is never allocated, so the
-// figure of merit is GFLOP/s on the ~4*M*N*d attention flops (causal ~ half).
-void benchmark_attention(int M, int N, int d, bool causal) {
-    if (M <= 0 || N <= 0 || d <= 0 || d > ATTN_DMAX) return;
-    const size_t sq  = (size_t)M * d * sizeof(float);
-    const size_t skv = (size_t)N * d * sizeof(float);
-
-    float *dQ, *dK, *dV, *dO;
-    CUDA_CHECK(cudaMalloc(&dQ, sq));
-    CUDA_CHECK(cudaMalloc(&dK, skv));
-    CUDA_CHECK(cudaMalloc(&dV, skv));
-    CUDA_CHECK(cudaMalloc(&dO, sq));
-    CUDA_CHECK(cudaMemset(dQ, 0, sq));
-    CUDA_CHECK(cudaMemset(dK, 0, skv));
-    CUDA_CHECK(cudaMemset(dV, 0, skv));
-
-    const float scale = 1.0f / std::sqrt((float)d);
-    auto run = [&]{ flash_attention_kernel<<<M, ATTN_THREADS>>>(M, N, d, scale, dQ, dK, dV, dO, causal); };
-    run(); CUDA_CHECK(cudaDeviceSynchronize()); // warm-up
-
-    const int iters = 50;
-    cudaEvent_t s, e; float ms = 0.f;
-    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int it = 0; it < iters; ++it) run();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
-
-    const double t = ms / iters;
-    double gflop = 4.0 * (double)M * N * d / 1e9; // Q*K^T and P*V, 2*M*N*d each
-    if (causal) gflop *= 0.5;                      // ~half masked (exact for M==N, which is what bench uses)
-    std::printf("  attention %s M=%d N=%d d=%d : %7.3f ms/iter   %7.2f GFLOP/s\n",
-                causal ? "causal" : "full  ", M, N, d, t, gflop / (t / 1e3));
-
-    cudaEventDestroy(s); cudaEventDestroy(e);
-    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
-}
-
 // ---------------------------------------------------------------------------
 // v2: query tiling. Where v1 gives one query row to a whole block (so every
 // block re-reads all of K and V), v2 gives a block a *tile* of ATTN2_BR query
@@ -207,9 +169,12 @@ void benchmark_attention(int M, int N, int d, bool causal) {
 // One thread per query row: each thread keeps its own running softmax (m, l) and
 // output accumulator acc[D] in registers, so there are NO cross-thread reductions
 // -- the rows are independent. The head dim D is a template parameter (dispatched
-// at runtime, like the fused GEMM's activation), which keeps q[D]/acc[D] register-
-// resident and the score/PV loops fully unrolled. K/V tiles live in shared memory,
-// read (broadcast) by all rows in the block.
+// at runtime, like the fused GEMM's activation), so the score/PV loops fully unroll
+// and q[D]/acc[D] stay register-resident -- for D<=64 (ptxas -v: 128 regs at D=32,
+// 218 at D=64, 0 spill). At D=128 the arrays exceed the 255-register/thread limit
+// and spill to local memory (~1 KB/thread); v2 still beats v1 there (the K/V reuse
+// outweighs the spill traffic), just by a smaller margin -- see the README table.
+// K/V tiles live in shared memory, read (broadcast) by all rows in the block.
 template <int D>
 __global__ void flash_attention_v2_kernel(int M, int N, float scale,
                                           const float* __restrict__ Q,
@@ -217,7 +182,9 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
                                           const float* __restrict__ V,
                                           float* __restrict__ O, bool causal) {
     constexpr int BR = ATTN2_BR, BC = ATTN2_BC;
-    __shared__ float Ks[BC][D + 1]; // padded stride -> no bank conflicts on the load
+    // [D+1] pads the row stride for the cooperative load; the per-score read is a
+    // broadcast (all rows read the same Ks[c][t]), so it needs no padding itself.
+    __shared__ float Ks[BC][D + 1];
     __shared__ float Vs[BC][D + 1];
 
     const int r = threadIdx.x;             // query row within the block

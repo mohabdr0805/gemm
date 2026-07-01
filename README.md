@@ -1,6 +1,6 @@
 # gemm-optim
 
-![CI](https://github.com/MohaBdr0805/gemm/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
 Optimized GEMM (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, single precision,
 row-major. The repo goes from a naive reference to tuned CPU and GPU kernels and
@@ -133,21 +133,29 @@ kernels make (shared tile → register tile): here **each thread owns one query 
 and keeps its running `(m, l)` and accumulator `acc[d]` in **registers**, so the
 rows are independent and there are no cross-thread reductions. The head dimension is
 a template parameter (dispatched at runtime for `d ∈ {32, 64, 128}`, like the fused
-GEMM's activation) so `q`/`acc` stay register-resident and the inner loops unroll;
-any other `d` transparently falls back to v1.
+GEMM's activation) so the inner loops fully unroll; any other `d` falls back to v1.
 
-Measured on an RTX 3080 (`sm_86`), head dim 64, `n×n`, device timing (GFLOP/s):
+`q[d]`/`acc[d]` stay register-resident up to **d = 64** — `ptxas -v` reports 128
+registers at d=32 and 218 at d=64, both with **0 spill**. At **d = 128** the arrays
+blow past the 255-register/thread limit and spill (~1 KB/thread); v2 still wins,
+because the `K`/`V` reuse more than pays for the spill traffic, just by less.
 
-| n    | v1 full | v2 full | speedup | v2 causal | speedup |
-|------|---------|---------|---------|-----------|---------|
-| 1024 | 61      | 195     | 3.2×    | 107       | 1.2×    |
-| 2048 | 61      | 354     | 5.8×    | 199       | 2.3×    |
-| 4096 | 67      | 688     | 10.3×   | 468       | 5.7×    |
+The number that's actually reproducible here is the **v2/v1 speedup** — the two
+kernels are timed back-to-back in the same power state, whereas the absolute
+GFLOP/s swings ~2–3× with the card's boost clocks. On an RTX 3080 (`sm_86`), `n×n`,
+full attention, device timing:
+
+| n    | speedup d=64 | speedup d=128 |
+|------|--------------|---------------|
+| 1024 | ~2.6×        | ~1.2×         |
+| 2048 | ~4.9×        | ~2.2×         |
+| 4096 | ~9.8×        | ~4.7×         |
 
 The gain grows with `n`: the longer the sequence, the more each cached `K`/`V` tile
-is reused. Because this is a single head, the benchmark only exposes `M/BR` blocks,
-so at tiny `n` — especially causal, which halves the work — v2 can be block-starved
-and v1's simplicity wins; the crossover is around `n = 1024`. A real workload adds
+is reused. d=128 gains less than d=64 — the register spill eats into it. And because
+this is a single head, the benchmark only exposes `M/BR` blocks, so at small `n`
+(especially causal, which halves the work) v2 can be block-starved and v1's
+simplicity wins; the crossover is around `n = 1024`. A real workload adds
 `batch·heads` more blocks and stays firmly in v2's favour.
 
 `./build/bench n` prints v1 vs v2 (full and causal) on your card.
