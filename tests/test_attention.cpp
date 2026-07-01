@@ -101,7 +101,9 @@ int main() {
     // so the score range is wide enough to need the safe/online softmax.
     {
         const double tol = 1e-3; // same margin as the GEMM/softmax tests
-        auto run_case = [&](int M, int N, int d, bool causal) {
+        using attn_fn = void (*)(int, int, int, float, const float*, const float*,
+                                 const float*, float*, bool);
+        auto run_case = [&](attn_fn fn, const char* name, int M, int N, int d, bool causal) {
             const float scale = 1.0f / std::sqrt((float)d);
             std::vector<float> Q(M * d), K(N * d), V(N * d), Oref(M * d), Ogpu(M * d);
             std::uniform_real_distribution<float> dd(-4.0f, 4.0f);
@@ -110,23 +112,34 @@ int main() {
             for (auto& x : V) x = dd(rng);
             for (int t = 0; t < d; ++t) { Q[t] *= 4.0f; K[t] *= 4.0f; } // widen scores
 
-            gemm::attention_ref       (M, N, d, scale, Q.data(), K.data(), V.data(), Oref.data(), causal);
-            gemm::flash_attention_cuda(M, N, d, scale, Q.data(), K.data(), V.data(), Ogpu.data(), causal);
+            gemm::attention_ref(M, N, d, scale, Q.data(), K.data(), V.data(), Oref.data(), causal);
+            fn                 (M, N, d, scale, Q.data(), K.data(), V.data(), Ogpu.data(), causal);
             double err = 0.0;
             for (int idx = 0; idx < M * d; ++idx)
                 err = std::max(err, (double)std::fabs(Oref[idx] - Ogpu[idx]));
-            std::printf("  flash vs oracle  M=%3d N=%3d d=%3d %-6s : %.3e (tol %.1e)%s\n",
-                        M, N, d, causal ? "causal" : "full", err, tol, err > tol ? "  <-- FAIL" : "");
+            std::printf("  %-2s vs oracle  M=%3d N=%3d d=%3d %-6s : %.3e (tol %.1e)%s\n",
+                        name, M, N, d, causal ? "causal" : "full", err, tol, err > tol ? "  <-- FAIL" : "");
             if (err > tol) rc = 1;
         };
 
-        run_case(100, 100,  80, false); // baseline, N not a tile multiple
-        run_case(100, 100,  80, true);
-        run_case( 64,   1,  64, false); // single key: the tile loop runs exactly once
-        run_case( 40, 100,  48, true);  // M < N causal
-        run_case(130,  64,  64, true);  // M > N causal: tail rows see every key
-        run_case( 96,  96, 128, false); // d at the ATTN_DMAX limit
-        run_case( 96,  96, 128, true);
+        // v1: broad shape coverage (single key, M != N, d at the ATTN_DMAX limit).
+        run_case(gemm::flash_attention_cuda, "v1", 100, 100,  80, false);
+        run_case(gemm::flash_attention_cuda, "v1", 100, 100,  80, true);
+        run_case(gemm::flash_attention_cuda, "v1",  64,   1,  64, false); // single key
+        run_case(gemm::flash_attention_cuda, "v1",  40, 100,  48, true);  // M < N causal
+        run_case(gemm::flash_attention_cuda, "v1", 130,  64,  64, true);  // M > N causal
+        run_case(gemm::flash_attention_cuda, "v1",  96,  96, 128, false); // d == ATTN_DMAX
+        run_case(gemm::flash_attention_cuda, "v1",  96,  96, 128, true);
+
+        // v2 (query-tiled): specialized dims 64 and 128, with M not a multiple of
+        // the row tile (ATTN2_BR=64) and M > N causal, plus one odd d to confirm the
+        // v1-fallback path also matches the oracle.
+        run_case(gemm::flash_attention_cuda_v2, "v2", 200, 200,  64, false);
+        run_case(gemm::flash_attention_cuda_v2, "v2", 200, 200,  64, true);
+        run_case(gemm::flash_attention_cuda_v2, "v2", 150, 100,  64, true);  // M > N, M % 64 != 0
+        run_case(gemm::flash_attention_cuda_v2, "v2", 130, 130, 128, false);
+        run_case(gemm::flash_attention_cuda_v2, "v2", 130, 130, 128, true);
+        run_case(gemm::flash_attention_cuda_v2, "v2",  70,  90,  48, true);  // odd d -> v1 fallback
     }
 #endif
 

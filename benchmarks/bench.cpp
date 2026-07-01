@@ -68,10 +68,11 @@ int main(int argc, char** argv) {
     gemm::benchmark_softmax(n, 1024);
 
     // Attention (FlashAttention-style): fused scores + softmax + P*V in one pass,
-    // never materializing the n x n score matrix. Head dim 64, full vs causal.
-    std::printf("\n[Attention FlashAttention-style]  device timing (no transfers)\n");
-    gemm::benchmark_attention(n, n, 64, /*causal=*/false);
-    gemm::benchmark_attention(n, n, 64, /*causal=*/true);
+    // never materializing the n x n score matrix. v1 (one query row per block) vs
+    // v2 (query tiling: K/V reused across the block's rows). Head dim 64.
+    std::printf("\n[Attention FlashAttention-style]  v1 vs v2, device timing (no transfers)\n");
+    gemm::benchmark_attention_versions(n, n, 64, /*causal=*/false);
+    gemm::benchmark_attention_versions(n, n, 64, /*causal=*/true);
 #endif
 
     return 0;

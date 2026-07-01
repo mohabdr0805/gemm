@@ -15,8 +15,9 @@ basic building block of an inference layer.
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C. About
   6.6× over v1, ~85% of the card's FP32 peak.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
-- Attention: a FlashAttention-style kernel (online softmax, no N×N matrix),
-  with an optional causal mask.
+- Attention: a FlashAttention-style kernel (online softmax, no N×N matrix) with
+  an optional causal mask, plus a query-tiled v2 that reuses K/V across a block
+  (up to ~10× over v1 at long sequence length).
 - A correctness test against the naive oracle and a GFLOP/s benchmark for each.
 
 ## Results
@@ -95,7 +96,7 @@ plus launch overhead: useful for shallow layers and small problems, negligible o
 large square GEMM where the GEMM dominates. On the GTX 1650 (GELU): 1.01× at 2048³,
 1.20× at 2048²·64, up to 1.7× on tiny matrices.
 
-## FlashAttention — `flash_attention_kernel`
+## FlashAttention v1 — `flash_attention_kernel`
 
 Attention is `O = softmax(scale · Q·Kᵀ) · V`. Done literally, that builds the
 `N×N` score matrix `S`, softmaxes it, then multiplies by `V` — three passes and
@@ -119,13 +120,37 @@ on. The shared `Ks`/`Vs` tiles are padded to `[BC][D+1]` to dodge bank conflicts
 just like the GEMM tiles. The **causal** mask costs nothing extra: row `i` simply
 stops its key loop at `i+1`, so tiles past the diagonal are never loaded.
 
-Because each block reads all of `K` and `V` once, global traffic is `O(M·N·d)`
-and there is no `N×N` allocation at all — the headline FlashAttention property.
-The next step (same v1→v2 story as the GEMM kernels) is to tile the *queries* too,
-so a block serves `Br` query rows and each loaded `K`/`V` tile is reused `Br`
-times; that is where the arithmetic intensity — and the real speedup — comes from.
+Because each block reads all of `K` and `V` once, v1's global traffic is
+`O(M·N·d)` with no `N×N` allocation at all — the headline FlashAttention property,
+but also its ceiling: at long sequence length it re-reads `K`/`V` `M` times.
 
-`./build/bench n` prints the kernel's GFLOP/s (full and causal) on your card.
+## FlashAttention v2 — `flash_attention_v2_kernel`
+
+Same online softmax, but a block now owns a **tile of `BR` query rows** instead of
+one, so each streamed `K`/`V` tile is read once and reused by all `BR` rows —
+`K`/`V` traffic drops from `M` reads to `M/BR`. It is the exact v1→v2 move the GEMM
+kernels make (shared tile → register tile): here **each thread owns one query row**
+and keeps its running `(m, l)` and accumulator `acc[d]` in **registers**, so the
+rows are independent and there are no cross-thread reductions. The head dimension is
+a template parameter (dispatched at runtime for `d ∈ {32, 64, 128}`, like the fused
+GEMM's activation) so `q`/`acc` stay register-resident and the inner loops unroll;
+any other `d` transparently falls back to v1.
+
+Measured on an RTX 3080 (`sm_86`), head dim 64, `n×n`, device timing (GFLOP/s):
+
+| n    | v1 full | v2 full | speedup | v2 causal | speedup |
+|------|---------|---------|---------|-----------|---------|
+| 1024 | 61      | 195     | 3.2×    | 107       | 1.2×    |
+| 2048 | 61      | 354     | 5.8×    | 199       | 2.3×    |
+| 4096 | 67      | 688     | 10.3×   | 468       | 5.7×    |
+
+The gain grows with `n`: the longer the sequence, the more each cached `K`/`V` tile
+is reused. Because this is a single head, the benchmark only exposes `M/BR` blocks,
+so at tiny `n` — especially causal, which halves the work — v2 can be block-starved
+and v1's simplicity wins; the crossover is around `n = 1024`. A real workload adds
+`batch·heads` more blocks and stays firmly in v2's favour.
+
+`./build/bench n` prints v1 vs v2 (full and causal) on your card.
 
 ## Build & run
 
@@ -188,4 +213,5 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] Fused inference epilogue (bias + activation)
 - [x] Docker + CI/CD (GitHub Actions, image on GHCR)
 - [x] Fused attention kernel (FlashAttention-style, online softmax + causal mask)
+- [x] Attention v2: query tiling (K/V reused across the block, up to ~10× over v1)
 - [ ] Multi-device StarPU variant
