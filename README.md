@@ -15,6 +15,8 @@ basic building block of an inference layer.
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C. About
   6.6× over v1, ~85% of the card's FP32 peak.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
+- Attention: a FlashAttention-style kernel (online softmax, no N×N matrix),
+  with an optional causal mask.
 - A correctness test against the naive oracle and a GFLOP/s benchmark for each.
 
 ## Results
@@ -93,6 +95,38 @@ plus launch overhead: useful for shallow layers and small problems, negligible o
 large square GEMM where the GEMM dominates. On the GTX 1650 (GELU): 1.01× at 2048³,
 1.20× at 2048²·64, up to 1.7× on tiny matrices.
 
+## FlashAttention — `flash_attention_kernel`
+
+Attention is `O = softmax(scale · Q·Kᵀ) · V`. Done literally, that builds the
+`N×N` score matrix `S`, softmaxes it, then multiplies by `V` — three passes and
+`O(N²)` memory, which is what blows up on long sequences. FlashAttention never
+writes `S`: it streams the keys and keeps a *running* softmax, so scores, softmax
+and the `P·V` product all happen in one fused pass with `O(N·d)` extra memory.
+
+The trick is the **online softmax**. Walking the keys in tiles, each query row
+carries three running quantities — the max score `m`, the normalizer
+`l = Σ exp(sⱼ − m)`, and the (unnormalized) output `acc = Σ exp(sⱼ − m)·vⱼ`. When
+a new tile raises the max from `m` to `m'`, the old state is simply rescaled by
+`exp(m − m')` before the tile is folded in; `O = acc / l` at the very end. That
+rescale is exactly what keeps the result identical to a global safe softmax while
+only ever seeing one tile at a time.
+
+The layout mirrors the softmax kernel: **one block per query row**. The block
+loads its query once, then for each key tile stages `K` and `V` in shared memory,
+computes the tile's scores (one thread per key), reduces the tile max and sum
+with the same tree reductions as `softmax_cuda`, updates `(m, l, acc)`, and moves
+on. The shared `Ks`/`Vs` tiles are padded to `[BC][D+1]` to dodge bank conflicts,
+just like the GEMM tiles. The **causal** mask costs nothing extra: row `i` simply
+stops its key loop at `i+1`, so tiles past the diagonal are never loaded.
+
+Because each block reads all of `K` and `V` once, global traffic is `O(M·N·d)`
+and there is no `N×N` allocation at all — the headline FlashAttention property.
+The next step (same v1→v2 story as the GEMM kernels) is to tile the *queries* too,
+so a block serves `Br` query rows and each loaded `K`/`V` tile is reused `Br`
+times; that is where the arithmetic intensity — and the real speedup — comes from.
+
+`./build/bench n` prints the kernel's GFLOP/s (full and causal) on your card.
+
 ## Build & run
 
 CPU (Linux/GCC or Windows/MinGW):
@@ -138,10 +172,12 @@ x86-64 host. The CPU image is published on each tagged release to
 ## Layout
 
 ```
-include/gemm/   headers (gemm_cpu.hpp, gemm_cuda.cuh, activation.hpp)
-src/            gemm_cpu.cpp (naive + tiled), gemm_cuda.cu (kernels)
-benchmarks/     GFLOP/s, v1 vs v2, fusion benchmark
-tests/          correctness vs the naive oracle
+include/gemm/   headers (gemm_cpu.hpp, gemm_cuda.cuh, activation.hpp,
+                softmax*.hpp/cuh, attention*.hpp/cuh)
+src/            gemm_cpu.cpp (naive + tiled), gemm_cuda.cu (kernels),
+                softmax_{cpu,cuda}, attention_{cpu,cuda}
+benchmarks/     GFLOP/s, v1 vs v2, fusion, softmax, attention benchmarks
+tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 ```
 
 ## Roadmap
@@ -151,5 +187,5 @@ tests/          correctness vs the naive oracle
 - [x] GPU v2: register tiling (8×8 per thread)
 - [x] Fused inference epilogue (bias + activation)
 - [x] Docker + CI/CD (GitHub Actions, image on GHCR)
-- [ ] Fused attention / softmax kernel (FlashAttention-style)
+- [x] Fused attention kernel (FlashAttention-style, online softmax + causal mask)
 - [ ] Multi-device StarPU variant
