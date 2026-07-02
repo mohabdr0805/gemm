@@ -31,5 +31,6 @@ CTestTestfile.cmake
 Thumbs.db
 .DS_Store
 
-# Personal handoff notes (kept out of the public repo)
+# Personal handoff notes and local build helper (kept out of the public repo)
 HANDOFF.md
+build.bat

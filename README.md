@@ -132,7 +132,7 @@ only ever seeing one tile at a time.
 The layout mirrors the softmax kernel: **one block per query row**. The block
 loads its query once, then for each key tile stages `K` and `V` in shared memory,
 computes the tile's scores (one thread per key), reduces the tile max and sum
-with the same tree reductions as `softmax_cuda`, updates `(m, l, acc)`, and moves
+with the same tree reductions as `softmax_rows_kernel`, updates `(m, l, acc)`, and moves
 on. The shared `Ks`/`Vs` tiles are padded to `[BC][D+1]` to dodge bank conflicts,
 just like the GEMM tiles. The **causal** mask costs nothing extra: row `i` simply
 stops its key loop at `i+1`, so tiles past the diagonal are never loaded.

@@ -12,7 +12,7 @@ jobs:
     name: Build & push CPU image to GHCR
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write # checkout + create the GitHub Release
       packages: write
     steps:
       - uses: actions/checkout@v4
@@ -32,3 +32,13 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ github.ref_name }}
             ${{ env.IMAGE }}:latest
+
+      # A tag without a Release page reads as "0 releases" on GitHub. Create it
+      # here, after the image push, so the release always has its artifact.
+      # Idempotent: skipped if the release already exists (e.g. v0.2.0, made by hand).
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

@@ -30,8 +30,13 @@ target_include_directories(gemm_cpu PUBLIC include)
 # /openmp:llvm selects MSVC's OpenMP 3.1+ runtime so the (ii,jj) tiles are really
 # spread across threads. GCC/Clang keep the normally-detected OpenMP.
 if(MSVC)
-  target_compile_options(gemm_cpu PUBLIC /openmp:llvm)
+  # PRIVATE: the OpenMP pragmas live only in the .cpp files (no public header
+  # uses OpenMP), and MSVC objects embed the libomp defaultlib directive, so
+  # consumers link fine without inheriting the flag.
+  target_compile_options(gemm_cpu PRIVATE /openmp:llvm)
 elseif(OpenMP_CXX_FOUND)
+  # PUBLIC on purpose here: with GCC/Clang the consumers of the static lib do
+  # need -fopenmp at link time to resolve the GOMP/omp symbols.
   target_link_libraries(gemm_cpu PUBLIC OpenMP::OpenMP_CXX)
 endif()
 

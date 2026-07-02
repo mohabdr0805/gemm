@@ -39,8 +39,8 @@ __global__ void gemm_kernel(int M, int N, int K, float alpha,
     for (int t = 0; t < ntiles; ++t) {
         const int ak = t * TILE + tx;
         const int bk = t * TILE + ty;
-        As[ty][tx] = (row < M && ak < K) ? A[row * K + ak] : 0.0f;
-        Bs[ty][tx] = (bk < K && col < N) ? B[bk * N + col] : 0.0f;
+        As[ty][tx] = (row < M && ak < K) ? A[(size_t)row * K + ak] : 0.0f;
+        Bs[ty][tx] = (bk < K && col < N) ? B[(size_t)bk * N + col] : 0.0f;
         __syncthreads();
 
         #pragma unroll
@@ -79,8 +79,8 @@ __global__ void gemm_bias_act_kernel(int M, int N, int K, float alpha,
     for (int t = 0; t < ntiles; ++t) {
         const int ak = t * TILE + tx;
         const int bk = t * TILE + ty;
-        As[ty][tx] = (row < M && ak < K) ? A[row * K + ak] : 0.0f;
-        Bs[ty][tx] = (bk < K && col < N) ? B[bk * N + col] : 0.0f;
+        As[ty][tx] = (row < M && ak < K) ? A[(size_t)row * K + ak] : 0.0f;
+        Bs[ty][tx] = (bk < K && col < N) ? B[(size_t)bk * N + col] : 0.0f;
         __syncthreads();
 
         #pragma unroll
@@ -281,13 +281,13 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
         for (int off = 0; off < BM; off += strideA) {
             const int gRow = blockRow + innerRowA + off, gCol = k0 + innerColA;
             As[(innerRowA + off) * BK + innerColA] =
-                (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+                (gRow < M && gCol < K) ? A[(size_t)gRow * K + gCol] : 0.0f;
         }
         #pragma unroll
         for (int off = 0; off < BK; off += strideB) {
             const int gRow = k0 + innerRowB + off, gCol = blockCol + innerColB;
             Bs[(innerRowB + off) * BN + innerColB] =
-                (gRow < K && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+                (gRow < K && gCol < N) ? B[(size_t)gRow * N + gCol] : 0.0f;
         }
         __syncthreads();
 

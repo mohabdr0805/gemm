@@ -21,6 +21,21 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  windows:
+    name: Windows (MSVC) build + tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No extra installs: windows-latest ships VS 2022 + CMake. This is the job
+      # that actually exercises the MSVC path (/openmp:llvm for the collapse(2)
+      # in gemm_tiled) -- the primary dev environment for this repo.
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
   cuda-compile:
     name: CUDA compile-check (no GPU on the runner)
     runs-on: ubuntu-latest
