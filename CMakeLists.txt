@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.18)
+cmake_minimum_required(VERSION 3.20) # 3.20: `ctest --test-dir` (used in docs/CI)
 project(gemm_optim LANGUAGES CXX)
 
 option(USE_CUDA "Build the CUDA implementation (requires an NVIDIA GPU + nvcc)" OFF)
@@ -9,10 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+# Keep /DNDEBUG resp. -DNDEBUG: overwriting the default Release flags without it
+# would silently re-enable assert() in release builds.
 if(MSVC)
-  set(CMAKE_CXX_FLAGS_RELEASE "/O2")
+  set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
 else()
-  set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
   if(GEMM_NATIVE)
     string(APPEND CMAKE_CXX_FLAGS_RELEASE " -march=native")
   endif()
@@ -35,11 +37,14 @@ endif()
 
 # --- CUDA library (optional) -------------------------------------------------
 if(USE_CUDA)
+  # Default archs: 75 = Turing (GTX 1650), 86 = Ampere (RTX 30xx). Only a
+  # default: -DCMAKE_CUDA_ARCHITECTURES=89 (Ada, etc.) on the command line wins.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "75;86")
+  endif()
   enable_language(CUDA)
   add_library(gemm_cuda src/gemm_cuda.cu src/softmax_cuda.cu src/attention_cuda.cu)
   target_include_directories(gemm_cuda PUBLIC include)
-  # 75 = Turing (GTX 1650), 86 = Ampere (RTX 30xx)
-  set_target_properties(gemm_cuda PROPERTIES CUDA_ARCHITECTURES "75;86")
 endif()
 
 # --- Benchmark ---------------------------------------------------------------

@@ -29,7 +29,7 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.21
         with:
-          cuda: '12.5.0'
+          cuda: '12.6.2' # same toolkit as Dockerfile.cuda -- one version to rule them all
           method: network
           sub-packages: '["nvcc"]'
       - name: Install cmake/g++
@@ -46,3 +46,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build CPU image
         run: docker build -t gemm-cpu .
+
+  docker-cuda:
+    name: Docker image build (CUDA, compile-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Building the image compiles all the CUDA kernels -- exactly the part that
+      # is verifiable without a GPU, so CI should exercise it.
+      - name: Build CUDA image
+        run: docker build -f Dockerfile.cuda -t gemm-cuda .

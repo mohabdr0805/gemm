@@ -1,4 +1,4 @@
-# gemm-optim
+# gemm
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
@@ -15,10 +15,13 @@ basic building block of an inference layer.
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C. About
   6.6× over v1, ~85% of the card's FP32 peak.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
+- Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
+  shared-memory tree reductions) — the warm-up for the attention kernels.
 - Attention: a FlashAttention-style kernel (online softmax, no N×N matrix) with
   an optional causal mask, plus a query-tiled v2 that reuses K/V across a block
   (up to ~10× over v1 at long sequence length).
-- A correctness test against the naive oracle and a GFLOP/s benchmark for each.
+- Every kernel is validated against a CPU oracle (`ctest`), with a device-timed
+  benchmark for each.
 
 ## Results
 
@@ -41,8 +44,9 @@ GPU kernel only (device timing, no transfers, n=2048):
 | v1 shared-memory tiled | 333     | ~13%      |
 | v2 register tiled      | 2213    | ~85%      |
 
-Register tiling is about 6.6× the v1 kernel. Every run also checks each kernel
-against the naive oracle (max error ~5e-6, tolerance 1e-3).
+Register tiling is about 6.6× the v1 kernel. `ctest` checks every kernel against
+its CPU oracle (max error ~5e-6, tolerance 1e-3); the benchmark itself only
+measures.
 
 ## CPU — `gemm_tiled`
 
@@ -96,6 +100,19 @@ plus launch overhead: useful for shallow layers and small problems, negligible o
 large square GEMM where the GEMM dominates. On the GTX 1650 (GELU): 1.01× at 2048³,
 1.20× at 2048²·64, up to 1.7× on tiny matrices.
 
+One honest caveat: the epilogue is currently fused into the **v1** tiling, while
+the register-tiled v2 is ~6.6× faster as a plain GEMM — templating the epilogue
+into `gemm_reg_kernel` is the natural next step (see Roadmap).
+
+## Softmax — `softmax_rows_kernel`
+
+Row-wise safe softmax (`out[i,:] = softmax(in[i,:])`, subtracting the row max
+before `exp` so nothing overflows): one block per row, two cooperative tree
+reductions in shared memory (row max, then sum of exp), threads striding over
+rows longer than the block. Memory-bound, so the benchmark reports effective
+bandwidth. It exists mostly as the stepping stone to the attention kernels below,
+which reuse its reduction idiom and turn its global softmax into an online one.
+
 ## FlashAttention v1 — `flash_attention_kernel`
 
 Attention is `O = softmax(scale · Q·Kᵀ) · V`. Done literally, that builds the
@@ -124,7 +141,11 @@ Because each block reads all of `K` and `V` once, v1's global traffic is
 `O(M·N·d)` with no `N×N` allocation at all — the headline FlashAttention property,
 but also its ceiling: at long sequence length it re-reads `K`/`V` `M` times.
 
-## FlashAttention v2 — `flash_attention_v2_kernel`
+## Attention v2 — query tiling (`flash_attention_v2_kernel`)
+
+*Naming note: "v2" is this repo's own v1→v2 progression (like the GEMM kernels),
+**not** the FlashAttention-2 algorithm — FA-2's warp-partitioned layout, where
+lanes cooperate on the head dimension, is a further step (see Roadmap).*
 
 Same online softmax, but a block now owns a **tile of `BR` query rows** instead of
 one, so each streamed `K`/`V` tile is read once and reused by all `BR` rows —
@@ -158,11 +179,14 @@ this is a single head, the benchmark only exposes `M/BR` blocks, so at small `n`
 simplicity wins; the crossover is around `n = 1024`. A real workload adds
 `batch·heads` more blocks and stays firmly in v2's favour.
 
-`./build/bench n` prints v1 vs v2 (full and causal) on your card.
+`./build/bench n` prints v1 vs v2 for both table dims — d = 64 and d = 128 —
+full and causal, on your card.
 
 ## Build & run
 
-CPU (Linux/GCC or Windows/MinGW):
+CPU (Linux/GCC, or Windows/MSVC — the build forces `/openmp:llvm` there so the
+tiled GEMM's `collapse(2)` is actually parallelized; classic `/openmp` is stuck
+at OpenMP 2.0 and silently ignores it):
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
@@ -177,7 +201,8 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ./build/bench 2048
 ```
-Target architectures are `75;86` (Turing + Ampere) in `CMakeLists.txt`.
+Default target architectures are `75;86` (Turing + Ampere); pass
+`-DCMAKE_CUDA_ARCHITECTURES=89` (Ada, etc.) to target your own card.
 
 ## Docker
 
@@ -197,8 +222,8 @@ x86-64 host. The CPU image is published on each tagged release to
 ## CI / CD
 
 - CI (`.github/workflows/ci.yml`): on every push/PR, builds and tests the CPU code,
-  compile-checks the CUDA build, and builds the CPU image. The runners have no GPU,
-  so the CUDA kernels are compiled but not run.
+  compile-checks the CUDA build, and builds both Docker images (CPU and CUDA). The
+  runners have no GPU, so the CUDA kernels are compiled but not run.
 - CD (`.github/workflows/release.yml`): on a `v*` tag, builds the CPU image and
   pushes it to GHCR. There is no service to deploy here; the artifact is the image.
 
@@ -220,6 +245,11 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] GPU v2: register tiling (8×8 per thread)
 - [x] Fused inference epilogue (bias + activation)
 - [x] Docker + CI/CD (GitHub Actions, image on GHCR)
+- [x] Row-wise softmax kernel (safe softmax: CPU oracle + CUDA)
 - [x] Fused attention kernel (FlashAttention-style, online softmax + causal mask)
 - [x] Attention v2: query tiling (K/V reused across the block, up to ~10× over v1)
+- [ ] Baselines: cuBLAS SGEMM and PyTorch SDPA on the same card
+- [ ] GEMM v3: vectorized `float4` loads + double buffering
+- [ ] Fused epilogue on the register-tiled v2 GEMM
+- [ ] Attention: FA-2-style warp-partitioned layout (fixes the d=128 spill)
 - [ ] Multi-device StarPU variant

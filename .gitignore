@@ -3,11 +3,11 @@ build/
 out/
 cmake-build-*/
 
-# CMake
+# CMake (in-source configure leftovers; `*.cmake` would swallow real modules)
 CMakeCache.txt
 CMakeFiles/
-*.cmake
-!CMakeLists.txt
+cmake_install.cmake
+CTestTestfile.cmake
 
 # Objects / binaries
 *.o

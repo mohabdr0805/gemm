@@ -1,6 +1,6 @@
-# CPU build of gemm-optim (naive + OpenMP-tiled GEMM).
-# Builds the project, runs the correctness test, and ships the benchmark as the
-# entrypoint.
+# CPU build of gemm-optim: GEMM (naive + OpenMP-tiled) plus the softmax and
+# attention CPU oracles. Builds the project, runs the test suite, and ships the
+# benchmark as the entrypoint.
 #   docker build -t gemm-cpu .
 #   docker run --rm gemm-cpu 2048
 FROM ubuntu:24.04

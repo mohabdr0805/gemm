@@ -115,7 +115,10 @@ void benchmark_softmax(int M, int N) {
     CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
 
     const double t = ms / iters;
-    const double gb = 2.0 * sz / 1e9; // one read + one write of M*N floats
+    // "Effective" bandwidth = algorithmic traffic (one read + one write of M*N)
+    // over time. The kernel's real traffic is ~5 M*N accesses (3 passes), so this
+    // deliberately understates hardware throughput -- standard convention.
+    const double gb = 2.0 * sz / 1e9;
     std::printf("  softmax %dx%d : %7.3f ms/iter   %7.2f GB/s\n",
                 M, N, t, gb / (t / 1e3));
 

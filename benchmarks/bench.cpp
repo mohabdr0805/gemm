@@ -40,13 +40,17 @@ int main(int argc, char** argv) {
         std::printf("naive : (skipped, too slow for n > 1024)\n");
     }
 
+    // Warm-up: the first OpenMP region pays the thread-pool spin-up, which would
+    // otherwise be billed to the timed run (same discipline as the device benches).
+    gemm::gemm_tiled(n, n, n, alpha, A.data(), B.data(), beta, C.data());
     double t = seconds([&]{ gemm::gemm_tiled(n, n, n, alpha, A.data(), B.data(), beta, C.data()); });
     std::printf("tiled : %8.3f s   %7.2f GFLOP/s\n", t, flops / t / 1e9);
 
 #ifdef USE_CUDA
     gemm::gemm_cuda(n, n, n, alpha, A.data(), B.data(), beta, C.data()); // warm-up (context init)
     double tc = seconds([&]{ gemm::gemm_cuda(n, n, n, alpha, A.data(), B.data(), beta, C.data()); });
-    std::printf("cuda  : %8.3f s   %7.2f GFLOP/s\n", tc, flops / tc / 1e9); // includes H2D/D2H
+    // whole-wrapper time: includes cudaMalloc/free and H2D/D2H, not just the kernel
+    std::printf("cuda  : %8.3f s   %7.2f GFLOP/s\n", tc, flops / tc / 1e9);
 
     // GEMM kernel v1 (shared-memory tiled) vs v2 (register tiled), device timing.
     std::printf("\n[GEMM kernel v1 vs v2]  device timing (no transfers)\n");
@@ -69,10 +73,14 @@ int main(int argc, char** argv) {
 
     // Attention (FlashAttention-style): fused scores + softmax + P*V in one pass,
     // never materializing the n x n score matrix. v1 (one query row per block) vs
-    // v2 (query tiling: K/V reused across the block's rows). Head dim 64.
+    // v2 (query tiling: K/V reused across the block's rows). Both head dims from
+    // the README table: 64 (register-resident) and 128 (spills, smaller gain).
     std::printf("\n[Attention FlashAttention-style]  v1 vs v2, device timing (no transfers)\n");
-    gemm::benchmark_attention_versions(n, n, 64, /*causal=*/false);
-    gemm::benchmark_attention_versions(n, n, 64, /*causal=*/true);
+    for (int d : { 64, 128 }) {
+        std::printf("d=%d:\n", d);
+        gemm::benchmark_attention_versions(n, n, d, /*causal=*/false);
+        gemm::benchmark_attention_versions(n, n, d, /*causal=*/true);
+    }
 #endif
 
     return 0;
