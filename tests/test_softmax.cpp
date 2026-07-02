@@ -77,22 +77,30 @@ int main() {
 
 #ifdef USE_CUDA
     // --- 2) GPU kernel vs CPU oracle -----------------------------------------
+    // Shapes: N > block size (256) -> rows take several strided passes;
+    // N < block size -> idle lanes in the tree reduction (the -FLT_MAX / 0
+    // neutral-element path the kernel comments call out); and N == 1 -> each
+    // row's softmax is exactly [1.0].
     {
-        const int M = 200, N = 300; // N > block size (256) -> multi-pass rows
-        std::vector<float> X(M * N), Yref(M * N), Ygpu(M * N);
-        std::uniform_real_distribution<float> d2(-5.0f, 5.0f);
-        for (auto& x : X) x = d2(rng);
-        for (int j = 0; j < N; ++j) { X[j] = 1e20f; X[N + j] = -1e20f; } // extreme rows
-
-        gemm::softmax_rows_ref (M, N, X.data(), Yref.data());
-        gemm::softmax_rows_cuda(M, N, X.data(), Ygpu.data());
-
         const double tol = 1e-3; // same margin as the GEMM tests
-        double err = 0.0;
-        for (int i = 0; i < M * N; ++i)
-            err = std::max(err, (double)std::fabs(Yref[i] - Ygpu[i]));
-        std::printf("Max abs error (softmax gpu vs oracle) : %.3e (tol %.1e)\n", err, tol);
-        if (err > tol) { std::printf("FAIL (softmax cuda)\n"); rc = 1; }
+        const int shapes[][2] = { {200, 300}, {64, 100}, {5, 1} };
+        for (const auto& sh : shapes) {
+            const int M = sh[0], N = sh[1];
+            std::vector<float> X(M * N), Yref(M * N), Ygpu(M * N);
+            std::uniform_real_distribution<float> d2(-5.0f, 5.0f);
+            for (auto& x : X) x = d2(rng);
+            for (int j = 0; j < N; ++j) { X[j] = 1e20f; X[N + j] = -1e20f; } // extreme rows
+
+            gemm::softmax_rows_ref (M, N, X.data(), Yref.data());
+            gemm::softmax_rows_cuda(M, N, X.data(), Ygpu.data());
+
+            double err = 0.0;
+            for (int i = 0; i < M * N; ++i)
+                err = std::max(err, (double)std::fabs(Yref[i] - Ygpu[i]));
+            std::printf("Max abs error (softmax gpu vs oracle, %3dx%3d) : %.3e (tol %.1e)\n",
+                        M, N, err, tol);
+            if (err > tol) { std::printf("FAIL (softmax cuda %dx%d)\n", M, N); rc = 1; }
+        }
     }
 #endif
 

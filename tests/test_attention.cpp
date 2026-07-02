@@ -131,9 +131,12 @@ int main() {
         run_case(gemm::flash_attention_cuda, "v1",  96,  96, 128, false); // d == ATTN_DMAX
         run_case(gemm::flash_attention_cuda, "v1",  96,  96, 128, true);
 
-        // v2 (query-tiled): specialized dims 64 and 128, with M not a multiple of
-        // the row tile (ATTN2_BR=64) and M > N causal, plus one odd d to confirm the
-        // v1-fallback path also matches the oracle.
+        // v2 (query-tiled): every specialized dim (32, 64, 128 are distinct template
+        // instantiations with distinct register allocation -- one passing does not
+        // validate the others), with M not a multiple of the row tile (ATTN2_BR=64)
+        // and M > N causal, plus one odd d to confirm the v1-fallback path.
+        run_case(gemm::flash_attention_cuda_v2, "v2",  90,  75,  32, false);
+        run_case(gemm::flash_attention_cuda_v2, "v2",  90,  75,  32, true);
         run_case(gemm::flash_attention_cuda_v2, "v2", 200, 200,  64, false);
         run_case(gemm::flash_attention_cuda_v2, "v2", 200, 200,  64, true);
         run_case(gemm::flash_attention_cuda_v2, "v2", 150, 100,  64, true);  // M > N, M % 64 != 0

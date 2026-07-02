@@ -50,8 +50,10 @@ __global__ void gemm_kernel(int M, int N, int K, float alpha,
     }
 
     if (row < M && col < N) {
-        const int idx = row * N + col;
-        C[idx] = alpha * acc + beta * C[idx];
+        const size_t idx = (size_t)row * N + col;
+        float out = alpha * acc;
+        if (beta != 0.0f) out += beta * C[idx]; // beta==0: C write-only (BLAS)
+        C[idx] = out;
     }
 }
 
@@ -88,8 +90,9 @@ __global__ void gemm_bias_act_kernel(int M, int N, int K, float alpha,
     }
 
     if (row < M && col < N) {
-        const int idx = row * N + col;
-        float v = alpha * acc + beta * C[idx];
+        const size_t idx = (size_t)row * N + col;
+        float v = alpha * acc;
+        if (beta != 0.0f) v += beta * C[idx]; // beta==0: C write-only (BLAS)
         if (bias) v += bias[col];
         C[idx] = apply_act(ACT, v);
     }
@@ -122,7 +125,8 @@ void gemm_cuda(int M, int N, int K, float alpha,
 
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice)); // for the beta*C term
+    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+        CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
 
     dim3 block(TILE, TILE);
     dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
@@ -162,7 +166,8 @@ void gemm_bias_act_cuda(int M, int N, int K, float alpha,
     CUDA_CHECK(cudaMalloc(&dC, sc));
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
+    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+        CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
     if (bias) {
         CUDA_CHECK(cudaMalloc(&dbias, sbias));
         CUDA_CHECK(cudaMemcpy(dbias, bias, sbias, cudaMemcpyHostToDevice));
@@ -308,8 +313,10 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
         for (int j = 0; j < TN; ++j) {
             const int gCol = blockCol + threadCol * TN + j;
             if (gCol >= N) continue;
-            const int idx = gRow * N + gCol;
-            C[idx] = alpha * acc[i][j] + beta * C[idx];
+            const size_t idx = (size_t)gRow * N + gCol;
+            float out = alpha * acc[i][j];
+            if (beta != 0.0f) out += beta * C[idx]; // beta==0: C write-only (BLAS)
+            C[idx] = out;
         }
     }
 }
@@ -326,7 +333,8 @@ void gemm_cuda_reg(int M, int N, int K, float alpha,
     CUDA_CHECK(cudaMalloc(&dC, sc));
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
+    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+        CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
 
     constexpr int BM = 128, BN = 128;
     dim3 block(256);
