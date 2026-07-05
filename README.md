@@ -41,11 +41,17 @@ End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 | 4096 | —     | 209                     | 354            |
 
 CPU tiled lands ~90× over naive at n=1024 and reaches 209 GFLOP/s at n=4096 —
-about 16% of the 12700F's AVX2 peak, with no cache cliff in sight: the A/B
-panels a thread streams per tile (64·n·4 B = 1 MB at n=4096) still fit the
-1.25 MB per-core L2. Single-threaded, vectorization alone is worth 7.8×
-(3.8 → 29.4 GFLOP/s) — see the `gemm_tiled` section for how MSVC had to be
-talked into it.
+about 16% of the 12700F's AVX2 peak, with no cache cliff in sight. That
+robustness comes from the three-level blocking itself: at any instant a thread
+touches only three 64×64 sub-blocks (3 × 16 KB, L1-resident at *any* n), so
+growing n shows up only as gentle bandwidth pressure from panel re-streaming,
+never as a cliff — measured 172 GFLOP/s at n=6144 and 154 at n=8192 (a mild
+−10% once twenty threads' panel re-reads lean on the shared 25 MB L3). We
+initially predicted a cliff at n=8192 ("the 64·n·4 = 2 MB panel exceeds the
+1.25 MB per-core L2") and the measurement refuted it — the panel governs
+inter-tile reuse, not the instantaneous working set. Single-threaded,
+vectorization alone is worth 7.8× (3.8 → 29.4 GFLOP/s) — see the `gemm_tiled`
+section for how MSVC had to be talked into it.
 
 GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 
