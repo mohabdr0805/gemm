@@ -16,7 +16,16 @@ void gemm_cuda(int M, int N, int K, float alpha,
 void gemm_cuda_reg(int M, int N, int K, float alpha,
                    const float* A, const float* B, float beta, float* C);
 
-// Device-timed comparison of v1 (shared-memory tiled) vs v2 (register tiled).
+// cuBLAS SGEMM baseline, same row-major convention (internally computes
+// C^T = B^T * A^T in cuBLAS's column-major world -- the standard swap). Same
+// beta==0 write-only semantics. Validated against the naive oracle like every
+// other kernel; used by the benchmark as the vendor reference.
+void gemm_cublas(int M, int N, int K, float alpha,
+                 const float* A, const float* B, float beta, float* C);
+
+// Device-timed comparison of v1 (shared-memory tiled) vs v2 (register tiled)
+// vs cuBLAS SGEMM, all back-to-back in the same power state -- so the ratios
+// (% of cuBLAS) are reproducible even when absolute GFLOP/s swing with clocks.
 void benchmark_gemm_versions(int M, int N, int K);
 
 // Fused inference epilogue: C = act( alpha*A*B + beta*C + bias[col] ).

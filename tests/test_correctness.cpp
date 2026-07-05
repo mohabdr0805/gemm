@@ -19,7 +19,7 @@ int main() {
 
     std::vector<float> A(M * K), B(K * N), C0(M * N), C1(M * N);
 #ifdef USE_CUDA
-    std::vector<float> C2(M * N), C3(M * N);
+    std::vector<float> C2(M * N), C3(M * N), C4(M * N);
 #endif
 
     std::mt19937 rng(42);
@@ -30,7 +30,7 @@ int main() {
         float v = dist(rng);
         C0[i] = v; C1[i] = v;
 #ifdef USE_CUDA
-        C2[i] = v; C3[i] = v;
+        C2[i] = v; C3[i] = v; C4[i] = v;
 #endif
     }
 
@@ -81,6 +81,15 @@ int main() {
         err_reg = std::max(err_reg, (double)std::fabs(C0[i] - C3[i]));
     std::printf("Max abs error (reg   vs naive) : %.3e (tol %.1e)\n", err_reg, tol);
     if (err_reg > tol) { std::printf("FAIL (reg)\n"); rc = 1; }
+
+    // cuBLAS baseline vs naive: validates the row-major <-> column-major swap
+    // (C^T = B^T A^T) before the benchmark quotes any "% of cuBLAS" number.
+    gemm::gemm_cublas(M, N, K, alpha, A.data(), B.data(), beta, C4.data());
+    double err_cb = 0.0;
+    for (int i = 0; i < M * N; ++i)
+        err_cb = std::max(err_cb, (double)std::fabs(C0[i] - C4[i]));
+    std::printf("Max abs error (cublas vs naive): %.3e (tol %.1e)\n", err_cb, tol);
+    if (err_cb > tol) { std::printf("FAIL (cublas)\n"); rc = 1; }
 
     // fused epilogue (GEMM + bias + activation) vs CPU oracle. ReLU/GELU with a
     // bias, plus the documented-but-otherwise-untested bias=nullptr + None combo.

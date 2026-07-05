@@ -4,6 +4,7 @@
 #include "gemm/gemm_cuda.cuh"
 
 #include <cuda_runtime.h>
+#include <cublas_v2.h> // vendor baseline: the number our kernels are measured against
 #include <cstdio>
 #include <cstdlib>
 
@@ -15,6 +16,16 @@
         if (err != cudaSuccess) {                                         \
             std::fprintf(stderr, "CUDA error %s:%d: %s\n",                \
                          __FILE__, __LINE__, cudaGetErrorString(err));    \
+            std::abort();                                                 \
+        }                                                                 \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                                \
+    do {                                                                  \
+        cublasStatus_t st = (call);                                       \
+        if (st != CUBLAS_STATUS_SUCCESS) {                                \
+            std::fprintf(stderr, "cuBLAS error %s:%d: status %d\n",       \
+                         __FILE__, __LINE__, (int)st);                    \
             std::abort();                                                 \
         }                                                                 \
     } while (0)
@@ -347,7 +358,40 @@ void gemm_cuda_reg(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// v1 vs v2, device timing, no transfers -> the pure kernel speedup from tiling.
+// cuBLAS SGEMM with this repo's row-major convention. cuBLAS is column-major;
+// the standard trick is to compute C^T = B^T * A^T: a row-major buffer read as
+// column-major IS the transpose, so passing (B, A) swapped with (N, M, K) and
+// leading dims (N, K, N) yields exactly our row-major C. No transpose kernels,
+// no copies. Same beta==0 write-only semantics as the rest of the repo.
+void gemm_cublas(int M, int N, int K, float alpha,
+                 const float* A, const float* B, float beta, float* C) {
+    const size_t sa = (size_t)M * K * sizeof(float);
+    const size_t sb = (size_t)K * N * sizeof(float);
+    const size_t sc = (size_t)M * N * sizeof(float);
+
+    float *dA, *dB, *dC;
+    CUDA_CHECK(cudaMalloc(&dA, sa));
+    CUDA_CHECK(cudaMalloc(&dB, sb));
+    CUDA_CHECK(cudaMalloc(&dC, sc));
+    CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
+    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+        CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
+
+    cublasHandle_t h;
+    CUBLAS_CHECK(cublasCreate(&h));
+    CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                             N, M, K, &alpha, dB, N, dA, K, &beta, dC, N));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUBLAS_CHECK(cublasDestroy(h));
+
+    CUDA_CHECK(cudaMemcpy(C, dC, sc, cudaMemcpyDeviceToHost));
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+}
+
+// v1 vs v2 vs cuBLAS SGEMM, device timing, no transfers. All three are timed
+// back-to-back in the same power state, so the RATIOS (v2/v1, % of cuBLAS) are
+// reproducible even though absolute GFLOP/s swing with the card's boost clocks.
 void benchmark_gemm_versions(int M, int N, int K) {
     const float alpha = 1.0f, beta = 0.0f;
     const size_t sa = (size_t)M * K * sizeof(float);
@@ -363,13 +407,18 @@ void benchmark_gemm_versions(int M, int N, int K) {
     dim3 b1(TILE, TILE), g1((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
     constexpr int BM = 128, BN = 128;
     dim3 b2(256), g2((N + BN - 1) / BN, (M + BM - 1) / BM);
+    cublasHandle_t h;
+    CUBLAS_CHECK(cublasCreate(&h));
     auto run_v1 = [&]{ gemm_kernel<<<g1, b1>>>(M, N, K, alpha, dA, dB, beta, dC); };
     auto run_v2 = [&]{ gemm_reg_kernel<<<g2, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
+    auto run_cb = [&]{ CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                                                N, M, K, &alpha, dB, N, dA, K, &beta, dC, N)); };
 
-    run_v1(); run_v2(); CUDA_CHECK(cudaDeviceSynchronize());
+    // Warm-up all three (the first cuBLAS call also pays its workspace init).
+    run_v1(); run_v2(); run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
 
     const int iters = 50;
-    cudaEvent_t s, e; float ms1 = 0.f, ms2 = 0.f;
+    cudaEvent_t s, e; float ms1 = 0.f, ms2 = 0.f, ms3 = 0.f;
     CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
     CUDA_CHECK(cudaEventRecord(s));
     for (int i = 0; i < iters; ++i) run_v1();
@@ -379,13 +428,20 @@ void benchmark_gemm_versions(int M, int N, int K) {
     for (int i = 0; i < iters; ++i) run_v2();
     CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
     CUDA_CHECK(cudaEventElapsedTime(&ms2, s, e));
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int i = 0; i < iters; ++i) run_cb();
+    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
+    CUDA_CHECK(cudaEventElapsedTime(&ms3, s, e));
 
-    const double gflop = 2.0 * M * N * K / 1e9;
-    const double t1 = ms1 / iters, t2 = ms2 / iters;
-    std::printf("  v1 shared-tiled : %7.3f ms/iter   %7.2f GFLOP/s\n", t1, gflop / (t1 / 1e3));
-    std::printf("  v2 register     : %7.3f ms/iter   %7.2f GFLOP/s\n", t2, gflop / (t2 / 1e3));
-    std::printf("  register-tiling speedup : %.2fx\n", t1 / t2);
+    const double gflop = 2.0 * (double)M * N * K / 1e9;
+    const double t1 = ms1 / iters, t2 = ms2 / iters, t3 = ms3 / iters;
+    const double g1f = gflop / (t1 / 1e3), g2f = gflop / (t2 / 1e3), g3f = gflop / (t3 / 1e3);
+    std::printf("  v1 shared-tiled : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)\n", t1, g1f, 100.0 * g1f / g3f);
+    std::printf("  v2 register     : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)\n", t2, g2f, 100.0 * g2f / g3f);
+    std::printf("  cuBLAS SGEMM    : %7.3f ms/iter  %8.2f GFLOP/s\n", t3, g3f);
+    std::printf("  register-tiling speedup v1->v2 : %.2fx\n", t1 / t2);
 
+    CUBLAS_CHECK(cublasDestroy(h));
     cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }

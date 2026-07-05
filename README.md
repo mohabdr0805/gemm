@@ -12,41 +12,50 @@ basic building block of an inference layer.
 - CPU: naive reference + cache-tiled OpenMP version.
 - GPU v1: shared-memory tiled kernel (coalesced loads, bank-conflict padding,
   border handling).
-- GPU v2: register tiling, each thread computing an 8×8 micro-block of C. About
-  6.6× over v1, ~85% of the card's FP32 peak.
+- GPU v2: register tiling, each thread computing an 8×8 micro-block of C.
+  7–11× over v1 (grows with size), ~54–61% of cuBLAS SGEMM on the same card.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
   shared-memory tree reductions) — the warm-up for the attention kernels.
 - Attention: a FlashAttention-style kernel (online softmax, no N×N matrix) with
   an optional causal mask, plus a query-tiled v2 that reuses K/V across a block
-  (up to ~10× over v1 at long sequence length).
+  (up to ~11× over v1 at long sequence length).
 - Every kernel is validated against a CPU oracle (`ctest`), with a device-timed
   benchmark for each.
 
 ## Results
 
-Measured on a GTX 1650 (Turing, `sm_75`, ~2.5 TFLOP/s FP32) with a 12-thread CPU,
-CUDA 13.3.
+Measured on an RTX 3080 10 GB (Ampere, `sm_86`) + i7-12700F (12C/20T), CUDA 13.0,
+Windows/MSVC. Methodology: every device figure is a 50-iteration average after a
+warm-up; the kernels **and cuBLAS** are timed back-to-back in the same run, so
+the ratios (% of cuBLAS, v1→v2) are reproducible even though absolute GFLOP/s
+move with the card's boost clocks (not locked here).
 
-End-to-end GFLOP/s (the CUDA figures include H2D/D2H transfers):
+End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 
-| n    | naive | CPU tiled (OpenMP) | GPU v1 |
-|------|-------|--------------------|--------|
-| 1024 | 0.80  | 46.5               | 104.6  |
-| 2048 | —     | 21.0               | 159.4  |
+| n    | naive | CPU tiled (OpenMP) | GPU v1 wrapper |
+|------|-------|--------------------|----------------|
+| 1024 | 0.71  | 34.0               | 593            |
+| 2048 | —     | 35.1               | 414            |
+| 4096 | —     | 34.1               | 354            |
 
-CPU tiled is about 58× the naive version at n=1024.
+CPU tiled is ~48× the naive version, and holds a flat ~34 GFLOP/s from 1024 to
+4096: the A/B panels a thread streams per tile (64·n·4 B = 1 MB at n=4096) still
+fit the 12700F's 1.25 MB per-core L2.
 
-GPU kernel only (device timing, no transfers, n=2048):
+GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 
-| kernel                 | GFLOP/s | FP32 peak |
-|------------------------|---------|-----------|
-| v1 shared-memory tiled | 333     | ~13%      |
-| v2 register tiled      | 2213    | ~85%      |
+| n    | v1 shared-tiled | v2 register | cuBLAS SGEMM | v2 vs cuBLAS |
+|------|-----------------|-------------|--------------|--------------|
+| 1024 | 537             | 3 798       | 8 719        | ~44%         |
+| 2048 | 457             | 4 809       | 7 858        | ~61%         |
+| 4096 | 460             | 5 210       | 9 602        | ~54%         |
 
-Register tiling is about 6.6× the v1 kernel. `ctest` checks every kernel against
-its CPU oracle (max error ~5e-6, tolerance 1e-3); the benchmark itself only
-measures.
+Register tiling is 7–11× the v1 kernel (the gap grows with n). Against the
+vendor library, v2 sits at **~54–61% of cuBLAS** at the larger sizes — an honest
+measure of the remaining headroom (vectorized `float4` loads, double buffering —
+see Roadmap). `ctest` checks every kernel — **cuBLAS included** — against the
+CPU oracle (max error ~1e-5, tolerance 1e-3); the benchmark itself only measures.
 
 ## CPU — `gemm_tiled`
 
@@ -70,18 +79,19 @@ is what actually moves the needle here (see below).
 
 ## Occupancy vs arithmetic intensity
 
-`ptxas` on `sm_75`:
+`ptxas` on `sm_86` (256-thread blocks; an `sm_86` SM runs up to 1536 threads):
 
-| kernel | registers/thread | shared/block | occupancy | throughput |
-|--------|------------------|--------------|-----------|------------|
-| v1     | 36 (0 spill)     | 2176 B       | 100%      | ~13% peak  |
-| v2     | 128 (0 spill)    | 8192 B       | 50%       | ~85% peak  |
+| kernel | registers/thread | shared/block | occupancy          | GFLOP/s (n=4096) |
+|--------|------------------|--------------|--------------------|------------------|
+| v1     | 37 (0 spill)     | 2176 B       | 100% (6 blocks/SM) | 460              |
+| v2     | 128 (0 spill)    | 8192 B       | 33% (2 blocks/SM)  | 5 210            |
 
-v1 is already at 100% theoretical occupancy but only ~13% of peak: it is limited by
-arithmetic intensity, not occupancy (one output per thread is too little reuse per
-load). v2 spends more registers, which drops occupancy to 50% (2 blocks/SM), but
-each thread now does 64 outputs from registers. The result is 6.6× and ~85% of
-peak. Past full occupancy, the lever is arithmetic intensity, not more occupancy.
+v1 sits at 100% theoretical occupancy yet is 11× slower than v2 running at a
+*third* of the occupancy: one output per thread is too little reuse per load —
+v1 is limited by arithmetic intensity, not occupancy. v2 spends 128 registers per
+thread to keep an 8×8 micro-block of C in registers (64 outputs per thread), so
+every shared-memory load feeds 8 FMAs. Past full occupancy, the lever is
+arithmetic intensity, not more occupancy.
 
 ## Fused inference epilogue
 
@@ -97,11 +107,13 @@ and the GPU kernel so the two cannot disagree.
 
 Fusion saves one M×N pass plus a launch, so the relative gain is about `TILE/K`
 plus launch overhead: useful for shallow layers and small problems, negligible on a
-large square GEMM where the GEMM dominates. On the GTX 1650 (GELU): 1.01× at 2048³,
-1.20× at 2048²·64, up to 1.7× on tiny matrices.
+large square GEMM where the GEMM dominates. On the RTX 3080 (GELU): within noise
+(0.97–1.16×) on big square GEMMs; mixed at thin K, from a small net **loss**
+(0.91× at 1024²·64) to 1.35× at 2048²·64 and 1.17× at 4096²·64; and ~1.5–2× on
+tiny matrices where the saved launch matters most.
 
 One honest caveat: the epilogue is currently fused into the **v1** tiling, while
-the register-tiled v2 is ~6.6× faster as a plain GEMM — templating the epilogue
+the register-tiled v2 is ~10× faster as a plain GEMM — templating the epilogue
 into `gemm_reg_kernel` is the natural next step (see Roadmap).
 
 ## Softmax — `softmax_rows_kernel`
@@ -110,8 +122,11 @@ Row-wise safe softmax (`out[i,:] = softmax(in[i,:])`, subtracting the row max
 before `exp` so nothing overflows): one block per row, two cooperative tree
 reductions in shared memory (row max, then sum of exp), threads striding over
 rows longer than the block. Memory-bound, so the benchmark reports effective
-bandwidth. It exists mostly as the stepping stone to the attention kernels below,
-which reuse its reduction idiom and turn its global softmax into an online one.
+bandwidth: ~530 GB/s at 1024² (the 4 MB matrix mostly lives in the 3080's 5 MB
+L2), dropping to ~120–220 GB/s once the matrix is DRAM-resident (the card's DRAM
+peak is 760 GB/s, and the kernel's real traffic is ~2.5× the algorithmic figure).
+It exists mostly as the stepping stone to the attention kernels below, which
+reuse its reduction idiom and turn its global softmax into an online one.
 
 ## FlashAttention v1 — `flash_attention_kernel`
 
@@ -168,9 +183,9 @@ full attention, device timing:
 
 | n    | speedup d=64 | speedup d=128 |
 |------|--------------|---------------|
-| 1024 | ~2.6×        | ~1.2×         |
-| 2048 | ~4.9×        | ~2.2×         |
-| 4096 | ~9.8×        | ~4.7×         |
+| 1024 | ~3×          | ~1.3×         |
+| 2048 | ~5.5–6.3×    | ~2.7–2.8×     |
+| 4096 | ~11×         | ~5.4×         |
 
 The gain grows with `n`: the longer the sequence, the more each cached `K`/`V` tile
 is reused. d=128 gains less than d=64 — the register spill eats into it. And because
@@ -247,9 +262,10 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] Docker + CI/CD (GitHub Actions, image on GHCR)
 - [x] Row-wise softmax kernel (safe softmax: CPU oracle + CUDA)
 - [x] Fused attention kernel (FlashAttention-style, online softmax + causal mask)
-- [x] Attention v2: query tiling (K/V reused across the block, up to ~10× over v1)
-- [ ] Baselines: cuBLAS SGEMM and PyTorch SDPA on the same card
-- [ ] GEMM v3: vectorized `float4` loads + double buffering
+- [x] Attention v2: query tiling (K/V reused across the block, up to ~11× over v1)
+- [x] Baseline: cuBLAS SGEMM, same card, same run (v2 ≈ 54–61% of cuBLAS)
+- [ ] Baseline: PyTorch SDPA for the attention kernels
+- [ ] GEMM v3: vectorized `float4` loads + double buffering (close the cuBLAS gap)
 - [ ] Fused epilogue on the register-tiled v2 GEMM
 - [ ] Attention: FA-2-style warp-partitioned layout (fixes the d=128 spill)
 - [ ] Multi-device StarPU variant

@@ -52,8 +52,9 @@ int main(int argc, char** argv) {
     // whole-wrapper time: includes cudaMalloc/free and H2D/D2H, not just the kernel
     std::printf("cuda  : %8.3f s   %7.2f GFLOP/s\n", tc, flops / tc / 1e9);
 
-    // GEMM kernel v1 (shared-memory tiled) vs v2 (register tiled), device timing.
-    std::printf("\n[GEMM kernel v1 vs v2]  device timing (no transfers)\n");
+    // GEMM kernels vs the vendor baseline, device timing. The "% of cuBLAS"
+    // ratios come from the same run, so they hold even when clocks swing.
+    std::printf("\n[GEMM v1 vs v2 vs cuBLAS]  device timing (no transfers)\n");
     gemm::benchmark_gemm_versions(n, n, n);
 
     // Fused inference epilogue: fusion vs two-pass (pure device timing, no transfers).

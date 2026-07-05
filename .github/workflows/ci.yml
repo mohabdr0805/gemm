@@ -47,6 +47,8 @@ jobs:
           cuda: '12.6.2' # same toolkit as Dockerfile.cuda -- one version to rule them all
           method: network
           sub-packages: '["nvcc"]'
+          # cuBLAS is linked as the benchmark baseline -> the compile-check needs it
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
       - name: Install cmake/g++
         run: sudo apt-get update && sudo apt-get install -y cmake g++
       - name: Configure (USE_CUDA=ON)

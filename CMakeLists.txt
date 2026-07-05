@@ -48,8 +48,12 @@ if(USE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES "75;86")
   endif()
   enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED) # for CUDA::cublas (the benchmark baseline)
   add_library(gemm_cuda src/gemm_cuda.cu src/softmax_cuda.cu src/attention_cuda.cu)
   target_include_directories(gemm_cuda PUBLIC include)
+  # PRIVATE is enough: CMake still adds cublas to the final link of consumers
+  # of this static library; no cuBLAS type appears in our public headers.
+  target_link_libraries(gemm_cuda PRIVATE CUDA::cublas)
 endif()
 
 # --- Benchmark ---------------------------------------------------------------
