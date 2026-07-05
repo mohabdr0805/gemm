@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20) # 3.20: `ctest --test-dir` (used in docs/CI
 project(gemm_optim LANGUAGES CXX)
 
 option(USE_CUDA "Build the CUDA implementation (requires an NVIDIA GPU + nvcc)" OFF)
-option(GEMM_NATIVE "Tune the build for the host CPU (-march=native); turn OFF for portable binaries/images" ON)
+option(GEMM_NATIVE "Tune the build for the host CPU (-march=native / MSVC /arch:AVX2); turn OFF for portable binaries/images" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,6 +13,13 @@ endif()
 # would silently re-enable assert() in release builds.
 if(MSVC)
   set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
+  # MSVC's x64 default is SSE2 (4-wide, no FMA): without /arch:AVX2 the tiled
+  # GEMM's vectorizable j-loop runs at half width and unfused mul+add. Guarded
+  # by GEMM_NATIVE for the same reason -march=native is: AVX2 binaries crash on
+  # pre-2013 CPUs, so portable/Docker builds keep the SSE2 baseline.
+  if(GEMM_NATIVE)
+    string(APPEND CMAKE_CXX_FLAGS_RELEASE " /arch:AVX2")
+  endif()
 else()
   set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
   if(GEMM_NATIVE)
@@ -33,7 +40,11 @@ if(MSVC)
   # PRIVATE: the OpenMP pragmas live only in the .cpp files (no public header
   # uses OpenMP), and MSVC objects embed the libomp defaultlib directive, so
   # consumers link fine without inheriting the flag.
-  target_compile_options(gemm_cpu PRIVATE /openmp:llvm)
+  # /openmp:experimental = the LLVM OpenMP runtime (so collapse(2) really
+  # parallelizes, like /openmp:llvm) PLUS the `omp simd` directive, which the
+  # tiled GEMM needs to vectorize its inner loop (MSVC refuses on its own,
+  # assuming C may alias B).
+  target_compile_options(gemm_cpu PRIVATE /openmp:experimental)
 elseif(OpenMP_CXX_FOUND)
   # PUBLIC on purpose here: with GCC/Clang the consumers of the static lib do
   # need -fopenmp at link time to resolve the GOMP/omp symbols.

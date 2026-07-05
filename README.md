@@ -9,7 +9,8 @@ basic building block of an inference layer.
 
 ## Contents
 
-- CPU: naive reference + cache-tiled OpenMP version.
+- CPU: naive reference + cache-tiled, OpenMP-parallel, SIMD-vectorized version
+  (~90× naive; 209 GFLOP/s at n=4096 on a 12700F).
 - GPU v1: shared-memory tiled kernel (coalesced loads, bank-conflict padding,
   border handling).
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C.
@@ -33,15 +34,18 @@ move with the card's boost clocks (not locked here).
 
 End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 
-| n    | naive | CPU tiled (OpenMP) | GPU v1 wrapper |
-|------|-------|--------------------|----------------|
-| 1024 | 0.71  | 34.0               | 593            |
-| 2048 | —     | 35.1               | 414            |
-| 4096 | —     | 34.1               | 354            |
+| n    | naive | CPU tiled (OpenMP+SIMD) | GPU v1 wrapper |
+|------|-------|-------------------------|----------------|
+| 1024 | 0.90  | 83                      | 593            |
+| 2048 | —     | 161                     | 414            |
+| 4096 | —     | 209                     | 354            |
 
-CPU tiled is ~48× the naive version, and holds a flat ~34 GFLOP/s from 1024 to
-4096: the A/B panels a thread streams per tile (64·n·4 B = 1 MB at n=4096) still
-fit the 12700F's 1.25 MB per-core L2.
+CPU tiled lands ~90× over naive at n=1024 and reaches 209 GFLOP/s at n=4096 —
+about 16% of the 12700F's AVX2 peak, with no cache cliff in sight: the A/B
+panels a thread streams per tile (64·n·4 B = 1 MB at n=4096) still fit the
+1.25 MB per-core L2. Single-threaded, vectorization alone is worth 7.8×
+(3.8 → 29.4 GFLOP/s) — see the `gemm_tiled` section for how MSVC had to be
+talked into it.
 
 GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 
@@ -62,6 +66,17 @@ CPU oracle (max error ~1e-5, tolerance 1e-3); the benchmark itself only measures
 C is split into 64×64 tiles to fit in cache. `#pragma omp parallel for collapse(2)`
 hands one whole tile to each thread, so there is no data race and no reduction. The
 inner i-k-j order keeps B and C accessed row by row.
+
+Row-wise is only half the point of that loop order — the other half is **SIMD**:
+the inner `Crow[j] += a * Brow[j]` over contiguous floats maps straight onto
+8-wide AVX2 FMAs, worth 7.8× single-threaded (3.8 → 29.4 GFLOP/s). Getting MSVC
+to actually emit them took three explicit steps, each one a lesson: `/arch:AVX2`
+(x64 defaults to 4-wide SSE2 — flag guarded by `GEMM_NATIVE`, AVX2 binaries
+crash on pre-2013 CPUs), `#pragma omp simd` + `__restrict` (MSVC refuses to
+auto-vectorize `C[i*N+j] += a*B[k*N+j]`, assuming C may alias B — `/Qvec-report`
+reason 1200; GCC emits a runtime overlap check instead), and hoisted row
+pointers (MSVC's vectorizer also balks at the mixed `(size_t)i*N + j`
+addressing). `/Qvec-report:2` confirms: `C5001: omp simd loop vectorized`.
 
 ## GPU v1 — `gemm_kernel`
 
@@ -199,9 +214,10 @@ full and causal, on your card.
 
 ## Build & run
 
-CPU (Linux/GCC, or Windows/MSVC — the build forces `/openmp:llvm` there so the
-tiled GEMM's `collapse(2)` is actually parallelized; classic `/openmp` is stuck
-at OpenMP 2.0 and silently ignores it):
+CPU (Linux/GCC, or Windows/MSVC — the build forces `/openmp:experimental` there:
+the LLVM OpenMP runtime so the tiled GEMM's `collapse(2)` is actually
+parallelized — classic `/openmp` is stuck at OpenMP 2.0 and silently ignores
+it — plus the `omp simd` directive its inner loop needs to vectorize):
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
