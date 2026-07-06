@@ -2,6 +2,12 @@
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
+> **TL;DR** — hand-written CUDA SGEMM reaching 54–61% of cuBLAS at n ≥ 2048
+> through shared-memory + register tiling, plus a FlashAttention-style attention
+> kernel gaining up to ~11× from query tiling. Every kernel is validated against
+> a CPU oracle; device figures are 50-iteration averages on an RTX 3080, with
+> cuBLAS timed in the same run.
+
 Optimized GEMM (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, single precision,
 row-major. The repo goes from a naive reference to tuned CPU and GPU kernels and
 measures each step. The CUDA side also has a fused bias+activation epilogue, the
@@ -14,7 +20,8 @@ basic building block of an inference layer.
 - GPU v1: shared-memory tiled kernel (coalesced loads, bank-conflict padding,
   border handling).
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C.
-  7–11× over v1 (grows with size), ~54–61% of cuBLAS SGEMM on the same card.
+  7–11× over v1 (grows with size), ~44–61% of cuBLAS SGEMM on the same card
+  (54–61% at n ≥ 2048; the n=1024 grid underfills the card — see Results).
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
   shared-memory tree reductions) — the warm-up for the attention kernels.
@@ -32,6 +39,11 @@ warm-up; the kernels **and cuBLAS** are timed back-to-back in the same run, so
 the ratios (% of cuBLAS, v1→v2) are reproducible even though absolute GFLOP/s
 move with the card's boost clocks (not locked here).
 
+*Scope: FP32 on CUDA cores throughout — no tensor cores. The cuBLAS baseline
+runs in its default math mode (plain `cublasSgemm`, no `cublasSetMathMode`, so
+TF32 is disabled): the comparison is like-for-like. Cross-check: cuBLAS matches
+the FP32 CPU oracle to ~7e-6 — TF32's 10-bit mantissa would sit around 1e-3.*
+
 End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 
 | n    | naive | CPU tiled (OpenMP+SIMD) | GPU v1 wrapper |
@@ -39,6 +51,12 @@ End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 | 1024 | 0.90  | 83                      | 593            |
 | 2048 | —     | 161                     | 414            |
 | 4096 | —     | 209                     | 354            |
+
+*Footnote: the end-to-end row is a single timed call (it catches the card at
+full boost), while the device-only table below averages 50 back-to-back
+iterations at sustained clocks — which is how the v1 wrapper can nominally
+exceed the bare v1 kernel at n = 1024 (593 vs 537). Absolute GFLOP/s move with
+clock state; the ratios within each table are the reproducible part.*
 
 CPU tiled lands ~90× over naive at n=1024 and reaches 209 GFLOP/s at n=4096 —
 about 16% of the 12700F's AVX2 peak, with no cache cliff in sight. That
@@ -61,8 +79,11 @@ GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 | 2048 | 457             | 4 809       | 7 858        | ~61%         |
 | 4096 | 460             | 5 210       | 9 602        | ~54%         |
 
-Register tiling is 7–11× the v1 kernel (the gap grows with n). Against the
-vendor library, v2 sits at **~54–61% of cuBLAS** at the larger sizes — an honest
+Register tiling is 7–11× the v1 kernel (the gap grows with n). The lower ~44%
+at n = 1024 is grid underfill, not the kernel: 128×128 tiles make only 64
+blocks for the 3080's 68 SMs × 2 resident blocks — the card runs half-empty
+(wave quantization). Against the vendor library, v2 sits at **~54–61% of
+cuBLAS** at the larger sizes — an honest
 measure of the remaining headroom (vectorized `float4` loads, double buffering —
 see Roadmap). `ctest` checks every kernel — **cuBLAS included** — against the
 CPU oracle (max error ~1e-5, tolerance 1e-3); the benchmark itself only measures.
@@ -97,6 +118,13 @@ and the shared tiles are padded to `[TILE][TILE+1]` to avoid bank conflicts.
 8×8 micro-block of C in registers, so every shared-memory load feeds 8 FMAs (an
 8×8 outer product is 64 FMAs for 16 loads). That raises arithmetic intensity, which
 is what actually moves the needle here (see below).
+
+Why these numbers: the 128×128 block tile with a K-step of 8 needs
+2 × (128×8) floats of shared memory = 8 KB per block. 256 threads each owning
+an 8×8 micro-block tile the block exactly (256 × 64 = 128×128). At
+128 registers/thread, one block consumes 32 K of the SM's 64 K register file,
+so exactly two blocks fit per SM — the 33% occupancy below is a budget spent
+deliberately: registers buy arithmetic intensity.
 
 ## Occupancy vs arithmetic intensity
 
@@ -285,7 +313,7 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] Row-wise softmax kernel (safe softmax: CPU oracle + CUDA)
 - [x] Fused attention kernel (FlashAttention-style, online softmax + causal mask)
 - [x] Attention v2: query tiling (K/V reused across the block, up to ~11× over v1)
-- [x] Baseline: cuBLAS SGEMM, same card, same run (v2 ≈ 54–61% of cuBLAS)
+- [x] Baseline: cuBLAS SGEMM, same card, same run (v2 ≈ 44–61%; 54–61% at n ≥ 2048)
 - [ ] Baseline: PyTorch SDPA for the attention kernels
 - [ ] GEMM v3: vectorized `float4` loads + double buffering (close the cuBLAS gap)
 - [ ] Fused epilogue on the register-tiled v2 GEMM
