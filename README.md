@@ -258,6 +258,7 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ./build/bench 1024
 ```
+on Windows, run from a "x64 Native Tools Command Prompt", or install CMake standalone.
 
 With CUDA (NVIDIA GPU + nvcc):
 ```bash
