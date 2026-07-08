@@ -73,11 +73,11 @@ section for how MSVC had to be talked into it.
 
 GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 
-| n    | v1 shared-tiled | v2 register | cuBLAS SGEMM | v2 vs cuBLAS |
-|------|-----------------|-------------|--------------|--------------|
-| 1024 | 537             | 3 798       | 8 719        | ~44%         |
-| 2048 | 457             | 4 809       | 7 858        | ~61%         |
-| 4096 | 460             | 5 210       | 9 602        | ~54%         |
+| n    | v1 shared-tiled | v2 register | cuBLAS SGEMM | v1 vs cuBLAS | v2 vs cuBLAS |
+|------|-----------------|-------------|--------------|--------------|--------------|
+| 1024 | 537             | 3 798       | 8 719        | ~6%          | ~44%         |
+| 2048 | 457             | 4 809       | 7 858        | ~6%          | ~61%         |
+| 4096 | 460             | 5 210       | 9 602        | ~5%          | ~54%         |
 
 Register tiling is 7–11× the v1 kernel (the gap grows with n). The lower ~44%
 at n = 1024 is grid underfill, not the kernel: 128×128 tiles make only 64
