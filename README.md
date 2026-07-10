@@ -24,13 +24,10 @@ basic building block of an inference layer.
   (54–61% at n ≥ 2048; the n=1024 grid underfills the card, see Results).
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
-  shared-memory tree reductions), used as a stepping stone for the attention
-  kernels.
+  shared-memory tree reductions); the attention kernels build on it.
 - Attention: a FlashAttention-style kernel (online softmax, no N×N matrix) with
   an optional causal mask, plus a query-tiled v2 that reuses K/V across a block
   (up to ~11× over v1 at long sequence length).
-- Every kernel is validated against a CPU oracle (`ctest`), with a device-timed
-  benchmark for each.
 
 ## Results
 
@@ -117,8 +114,8 @@ and the shared tiles are padded to `[TILE][TILE+1]` to avoid bank conflicts.
 
 128×128 block tile, K stepped in chunks of 8, 256 threads. Each thread keeps an
 8×8 micro-block of C in registers, so every shared-memory load feeds 8 FMAs (an
-8×8 outer product is 64 FMAs for 16 loads). That raises arithmetic intensity,
-which is the metric that matters here (see below).
+8×8 outer product is 64 FMAs for 16 loads). That raises arithmetic intensity
+(see below).
 
 Why these numbers: a 128×128 block tile with a K-step of 8 needs 2 × (128×8)
 floats of shared memory = 8 KB per block. 256 threads each owning an 8×8
@@ -138,9 +135,7 @@ raise arithmetic intensity, which is worth more than occupancy at this point.
 
 v1 sits at 100% theoretical occupancy yet runs 11× slower than v2 at a third of
 the occupancy. One output per thread gives too little reuse per load: v1 is
-limited by arithmetic intensity, not occupancy. v2 spends 128 registers per
-thread to keep an 8×8 micro-block of C in registers (64 outputs per thread), so
-every shared-memory load feeds 8 FMAs. Past full occupancy, arithmetic
+limited by arithmetic intensity, not occupancy. Past full occupancy, arithmetic
 intensity is the only lever left.
 
 ## Fused inference epilogue
