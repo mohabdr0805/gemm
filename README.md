@@ -257,12 +257,12 @@ l, l+32, ..., so at d=128 each lane holds only d/32 = 4 elements of q and acc.
 ptxas then reports 64 registers and 0 spill.
 
 Splitting d breaks one thing: the score `s = <q, k>` is a sum over d, now spread
-across the lanes. Each lane computes its partial dot and a warp butterfly
-(`__shfl_xor`, registers only) reduces the 32 partials into the full score in
-every lane. That is the only cross-lane step. The running softmax scalars (m, l)
-are per-row, so every lane recomputes them identically; and the P·V product is
-lane-independent (each lane accumulates its own output dims). The only reduction
-lives at warp level, never at block level.
+across the lanes. Each lane computes its partial dot, and a warp butterfly
+(`__shfl_xor`, registers only) sums the 32 partials into the full score, present
+in every lane. That is the only cross-lane communication. The running softmax
+scalars (m, l) are per-row, so every lane recomputes them identically; the P·V
+product is lane-independent, each lane accumulating its own output dims. The one
+reduction stays in registers, so it never touches shared memory or a block sync.
 
 Measured on an RTX 3080, `n×n`, full attention, GFLOP/s:
 
@@ -272,14 +272,14 @@ Measured on an RTX 3080, `n×n`, full attention, GFLOP/s:
 | 2048 | 526      | 1613       | 3.07×   | 1007    | 1305      | 1.30×   |
 | 4096 | 1038     | 1705       | 1.64×   | 1996    | 1442      | 0.72×   |
 
-At d=128 (a common head dim) FA-2 wins across the board — no spill, and a flat
-~1600-1700 GFLOP/s regardless of n. At d=64, where v2 does not spill, it is a
-trade-off: FA-2 gives a row to a warp, so a block serves only 8 rows against
-v2's 64, meaning each shared K/V tile is reused 8× per block instead of 64×. At
-large n the K/V traffic dominates and v2's higher reuse wins (0.72× at n=4096);
-at small n v2 is block-starved (16 blocks for 68 SMs, wave quantization) while
-FA-2's smaller row tile fills the card, so FA-2 wins. The right kernel depends on
-the regime: FA-2 for d=128, v2 for d≤64 at long sequence length.
+At d=128 FA-2 wins at every size: no spill, and a flat ~1600–1700 GFLOP/s
+regardless of n. At d=64, where v2 does not spill, it is a trade-off. FA-2 gives
+a row to a warp, so a block serves only 8 rows against v2's 64, and each shared
+K/V tile is reused 8× per block instead of 64×. At large n the K/V traffic
+dominates, so v2's higher reuse wins (0.72× at n=4096); at small n v2 is
+block-starved (16 blocks for 68 SMs, wave quantization) while FA-2's smaller row
+tile fills the card, so FA-2 wins. The right kernel depends on the regime: FA-2
+for d=128, v2 for d≤64 at long sequence length.
 
 ## Build & run
 
