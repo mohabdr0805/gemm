@@ -82,6 +82,14 @@ int main(int argc, char** argv) {
         gemm::benchmark_attention_versions(n, n, d, /*causal=*/false);
         gemm::benchmark_attention_versions(n, n, d, /*causal=*/true);
     }
+
+    // v2 (one thread per row) vs FA-2 (one warp per row, head dim split across
+    // lanes). FA-2 removes v2's d=128 register spill; the win is largest at d=128.
+    std::printf("\n[Attention v2 vs FA-2 warp-partitioned]  device timing (no transfers)\n");
+    for (int d : { 64, 128 }) {
+        std::printf("d=%d:\n", d);
+        gemm::benchmark_attention_fa2(n, n, d, /*causal=*/false);
+    }
 #endif
 
     return 0;

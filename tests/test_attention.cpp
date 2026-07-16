@@ -143,6 +143,19 @@ int main() {
         run_case(gemm::flash_attention_cuda_v2, "v2", 130, 130, 128, false);
         run_case(gemm::flash_attention_cuda_v2, "v2", 130, 130, 128, true);
         run_case(gemm::flash_attention_cuda_v2, "v2",  70,  90,  48, true);  // odd d -> v1 fallback
+
+        // FA-2 (warp-partitioned): one warp per row, head dim split across 32 lanes.
+        // Each dim is a distinct template instantiation; M not a multiple of the row
+        // tile (ATTN_FA2_WPB=8), M > N causal, single key, and one odd d -> v2 fallback.
+        run_case(gemm::flash_attention_cuda_fa2, "f2", 100, 100,  32, false);
+        run_case(gemm::flash_attention_cuda_fa2, "f2", 100, 100,  32, true);
+        run_case(gemm::flash_attention_cuda_fa2, "f2", 100, 100,  64, false);
+        run_case(gemm::flash_attention_cuda_fa2, "f2", 100, 100,  64, true);
+        run_case(gemm::flash_attention_cuda_fa2, "f2", 130, 130, 128, false); // M % 8 != 0
+        run_case(gemm::flash_attention_cuda_fa2, "f2", 130, 130, 128, true);
+        run_case(gemm::flash_attention_cuda_fa2, "f2", 130,  64, 128, true);  // M > N causal
+        run_case(gemm::flash_attention_cuda_fa2, "f2",  64,   1,  64, false); // single key
+        run_case(gemm::flash_attention_cuda_fa2, "f2",  70,  90,  48, true);  // odd d -> v2 fallback
     }
 #endif
 

@@ -20,6 +20,9 @@
 #define ATTN2_BR     64  // v2: query rows per block (== threads per block)
 #define ATTN2_BC     32  // v2: key tile width
 
+#define ATTN_FA2_WPB 8   // FA-2: warps per block (== query rows per block, one warp/row)
+#define ATTN_FA2_BC  32  // FA-2: key tile width
+
 // Same abort-on-error helper as the other .cu files (kept local so this kernel
 // is self-contained).
 #define CUDA_CHECK(call)                                                  \
@@ -256,6 +259,114 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
     }
 }
 
+// ---------------------------------------------------------------------------
+// FA-2-style: warp-partitioned head dimension. Where v2 gives a whole query row
+// to ONE thread (which then holds q[D] and acc[D] in registers, and spills at
+// D=128: 256+ floats > 255-register limit), FA-2 gives a row to a WHOLE WARP and
+// splits D across its 32 lanes. Lane `l` owns dims l, l+32, ... so at D=128 each
+// lane holds only D/32 = 4 elements of q and acc -- no spill, ever.
+//
+// Splitting D breaks one thing: the score s = <q, k> is a sum OVER D, now spread
+// across lanes. So each lane computes its partial dot and a warp butterfly
+// reduction (__shfl_xor, registers only, no shared memory) sums the 32 partials
+// into the full score, present in every lane. That is the one cross-lane step.
+// The running softmax scalars (m, l) are per-row, hence warp-uniform -- every
+// lane recomputes them identically, no communication. And the P*V accumulation
+// is embarrassingly parallel: each lane owns its output dims, acc[k] += p*V[..],
+// no reduction at all. FA-2's idea: keep the only reduction at warp level.
+//
+// Requires D % 32 == 0 (true for 32/64/128). A block is ATTN_FA2_WPB warps, so it
+// serves that many query rows and reuses each shared K/V tile across all of them.
+template <int D>
+__global__ void flash_attention_fa2_kernel(int M, int N, float scale,
+                                           const float* __restrict__ Q,
+                                           const float* __restrict__ K,
+                                           const float* __restrict__ V,
+                                           float* __restrict__ O, bool causal) {
+    constexpr int WPB = ATTN_FA2_WPB, BC = ATTN_FA2_BC;
+    constexpr int DL  = D / 32;   // head-dim elements owned by each lane
+    constexpr int BR  = WPB;      // query rows per block (one warp each)
+
+    __shared__ float Ks[BC][D];   // score/PV reads are stride-1 across lanes -> no bank conflict
+    __shared__ float Vs[BC][D];
+
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;    // 0..31 : which slice of D this thread owns
+    const int warp = tid >> 5;    // 0..WPB-1 : which query row in the block
+    const int nthreads = blockDim.x;
+    const int i = blockIdx.x * BR + warp;   // global query row (warp-uniform)
+    const bool active = (i < M);
+
+    // Per-lane slice of the query and accumulator: DL elements, dims lane+32*k.
+    float q[DL], acc[DL];
+    #pragma unroll
+    for (int k = 0; k < DL; ++k) {
+        const int t = lane + k * 32;
+        q[k]   = active ? Q[(size_t)i * D + t] : 0.0f;
+        acc[k] = 0.0f;
+    }
+    float m = -FLT_MAX, l = 0.0f;
+    const int nkeys_i     = causal ? min(N, i + 1) : N;
+    const int nkeys_block = causal ? min(N, min(blockIdx.x * BR + BR, M)) : N;
+
+    for (int j0 = 0; j0 < nkeys_block; j0 += BC) {
+        const int tile = min(BC, N - j0);
+
+        // Cooperative load of the K/V tile (all threads, all warps share it).
+        for (int idx = tid; idx < tile * D; idx += nthreads) {
+            const int c = idx / D, t = idx % D;
+            Ks[c][t] = K[(size_t)(j0 + c) * D + t];
+            Vs[c][t] = V[(size_t)(j0 + c) * D + t];
+        }
+        __syncthreads();
+
+        if (active) {
+            float s[BC];
+            float tile_max = -FLT_MAX;
+            int cnt = 0;
+            #pragma unroll
+            for (int c = 0; c < BC; ++c) {
+                if (c >= tile || j0 + c >= nkeys_i) break; // warp-uniform: no divergent shuffle
+                // (1) each lane's partial dot over its DL dims...
+                float partial = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < DL; ++k) partial += q[k] * Ks[c][lane + k * 32];
+                // (2) ...butterfly-reduced across the 32 lanes -> full score in every lane.
+                #pragma unroll
+                for (int off = 16; off > 0; off >>= 1)
+                    partial += __shfl_xor_sync(0xffffffff, partial, off);
+                s[c] = scale * partial;
+                tile_max = fmaxf(tile_max, s[c]);
+                cnt = c + 1;
+            }
+            if (cnt > 0) {
+                const float m_new = fmaxf(m, tile_max);
+                const float corr  = expf(m - m_new);
+                l *= corr;
+                #pragma unroll
+                for (int k = 0; k < DL; ++k) acc[k] *= corr;
+                #pragma unroll
+                for (int c = 0; c < BC; ++c) {
+                    if (c >= cnt) break;
+                    const float p = expf(s[c] - m_new);
+                    l += p;
+                    // (3) P*V: each lane accumulates only ITS output dims -- no cross-lane.
+                    #pragma unroll
+                    for (int k = 0; k < DL; ++k) acc[k] += p * Vs[c][lane + k * 32];
+                }
+                m = m_new;
+            }
+        }
+        __syncthreads(); // before the next tile overwrites Ks/Vs
+    }
+
+    if (active) {
+        const float inv = 1.0f / l;
+        #pragma unroll
+        for (int k = 0; k < DL; ++k) O[(size_t)i * D + (lane + k * 32)] = acc[k] * inv;
+    }
+}
+
 // v2 only specializes the common head dims; anything else falls back to v1.
 static bool v2_supports(int d) { return d == 32 || d == 64 || d == 128; }
 
@@ -295,6 +406,50 @@ void flash_attention_cuda_v2(int M, int N, int d, float scale,
     dim3 block(ATTN2_BR);
     dim3 grid((M + ATTN2_BR - 1) / ATTN2_BR);
     launch_v2(grid, block, M, N, d, scale, dQ, dK, dV, dO, causal);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(O, dO, sq, cudaMemcpyDeviceToHost));
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+}
+
+// FA-2 supports the same specialized head dims as v2 (all multiples of 32).
+static void launch_fa2(dim3 grid, dim3 block, int M, int N, int d, float scale,
+                       const float* dQ, const float* dK, const float* dV,
+                       float* dO, bool causal) {
+    switch (d) {
+        case 32:  flash_attention_fa2_kernel<32> <<<grid, block>>>(M, N, scale, dQ, dK, dV, dO, causal); break;
+        case 64:  flash_attention_fa2_kernel<64> <<<grid, block>>>(M, N, scale, dQ, dK, dV, dO, causal); break;
+        case 128: flash_attention_fa2_kernel<128><<<grid, block>>>(M, N, scale, dQ, dK, dV, dO, causal); break;
+        default:
+            std::fprintf(stderr, "launch_fa2: unsupported head dim d=%d (expected 32/64/128)\n", d);
+            std::abort();
+    }
+}
+
+void flash_attention_cuda_fa2(int M, int N, int d, float scale,
+                              const float* Q, const float* K, const float* V,
+                              float* O, bool causal) {
+    if (M <= 0 || N <= 0 || d <= 0) return;
+    if (!v2_supports(d)) { // no FA-2 kernel for this head dim -> reuse v2's own fallback chain
+        flash_attention_cuda_v2(M, N, d, scale, Q, K, V, O, causal);
+        return;
+    }
+    const size_t sq  = (size_t)M * d * sizeof(float);
+    const size_t skv = (size_t)N * d * sizeof(float);
+
+    float *dQ, *dK, *dV, *dO;
+    CUDA_CHECK(cudaMalloc(&dQ, sq));
+    CUDA_CHECK(cudaMalloc(&dK, skv));
+    CUDA_CHECK(cudaMalloc(&dV, skv));
+    CUDA_CHECK(cudaMalloc(&dO, sq));
+    CUDA_CHECK(cudaMemcpy(dQ, Q, sq,  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dK, K, skv, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV, V, skv, cudaMemcpyHostToDevice));
+
+    dim3 block(32 * ATTN_FA2_WPB);
+    dim3 grid((M + ATTN_FA2_WPB - 1) / ATTN_FA2_WPB);
+    launch_fa2(grid, block, M, N, d, scale, dQ, dK, dV, dO, causal);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -346,6 +501,56 @@ void benchmark_attention_versions(int M, int N, int d, bool causal) {
     std::printf("  v2 query-tiled     %s : %7.3f ms/iter   %7.2f GFLOP/s\n",
                 causal ? "causal" : "full  ", t2, gflop / (t2 / 1e3));
     std::printf("  query-tiling speedup : %.2fx\n", t1 / t2);
+
+    cudaEventDestroy(s); cudaEventDestroy(e);
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+}
+
+// v2 (one thread per row) vs FA-2 (one warp per row, head dim split across lanes),
+// device timing, no transfers. The question this answers: does FA-2's spill-free
+// register footprint at d=128 outweigh v2's higher K/V reuse? d in {32,64,128}.
+void benchmark_attention_fa2(int M, int N, int d, bool causal) {
+    if (M <= 0 || N <= 0 || !v2_supports(d)) return;
+    const size_t sq  = (size_t)M * d * sizeof(float);
+    const size_t skv = (size_t)N * d * sizeof(float);
+
+    float *dQ, *dK, *dV, *dO;
+    CUDA_CHECK(cudaMalloc(&dQ, sq));
+    CUDA_CHECK(cudaMalloc(&dK, skv));
+    CUDA_CHECK(cudaMalloc(&dV, skv));
+    CUDA_CHECK(cudaMalloc(&dO, sq));
+    CUDA_CHECK(cudaMemset(dQ, 0, sq));
+    CUDA_CHECK(cudaMemset(dK, 0, skv));
+    CUDA_CHECK(cudaMemset(dV, 0, skv));
+
+    const float scale = 1.0f / std::sqrt((float)d);
+    dim3 b2(ATTN2_BR), g2((M + ATTN2_BR - 1) / ATTN2_BR);
+    dim3 bf(32 * ATTN_FA2_WPB), gf((M + ATTN_FA2_WPB - 1) / ATTN_FA2_WPB);
+    auto run_v2  = [&]{ launch_v2 (g2, b2, M, N, d, scale, dQ, dK, dV, dO, causal); };
+    auto run_fa2 = [&]{ launch_fa2(gf, bf, M, N, d, scale, dQ, dK, dV, dO, causal); };
+
+    run_v2(); run_fa2(); CUDA_CHECK(cudaDeviceSynchronize()); // warm-up
+
+    const int iters = 50;
+    cudaEvent_t s, e; float ms2 = 0.f, msf = 0.f;
+    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int it = 0; it < iters; ++it) run_v2();
+    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
+    CUDA_CHECK(cudaEventElapsedTime(&ms2, s, e));
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int it = 0; it < iters; ++it) run_fa2();
+    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
+    CUDA_CHECK(cudaEventElapsedTime(&msf, s, e));
+
+    double gflop = 4.0 * (double)M * N * d / 1e9;
+    if (causal) gflop *= 0.5;
+    const double t2 = ms2 / iters, tf = msf / iters;
+    std::printf("  v2  one-thread/row %s : %7.3f ms/iter   %7.2f GFLOP/s\n",
+                causal ? "causal" : "full  ", t2, gflop / (t2 / 1e3));
+    std::printf("  fa2 one-warp/row   %s : %7.3f ms/iter   %7.2f GFLOP/s\n",
+                causal ? "causal" : "full  ", tf, gflop / (tf / 1e3));
+    std::printf("  fa2 vs v2 speedup : %.2fx\n", t2 / tf);
 
     cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);

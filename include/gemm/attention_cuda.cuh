@@ -33,8 +33,21 @@ void flash_attention_cuda_v2(int M, int N, int d, float scale,
                              const float* Q, const float* K, const float* V,
                              float* O, bool causal);
 
+// FA-2-style: warp-partitioned head dimension. One warp per query row, with d
+// split across its 32 lanes (each lane owns d/32 elements of q and acc), so the
+// per-row state never spills -- the fix for v2's d=128 spill. The QK^T dot uses a
+// warp shuffle reduction; the P*V product stays lane-independent. Specialized for
+// d in {32, 64, 128}; any other d falls back to v2. Same result as v1/v2.
+void flash_attention_cuda_fa2(int M, int N, int d, float scale,
+                              const float* Q, const float* K, const float* V,
+                              float* O, bool causal);
+
 // Device-timed v1 vs v2 (no transfers): the pure kernel speedup from query
 // tiling. Use a head dim d in {32, 64, 128} so v2 runs its specialized kernel.
 void benchmark_attention_versions(int M, int N, int d, bool causal);
+
+// Device-timed v2 vs FA-2 (no transfers): does the spill-free FA-2 footprint at
+// d=128 beat v2's higher K/V reuse? Use a head dim d in {32, 64, 128}.
+void benchmark_attention_fa2(int M, int N, int d, bool causal);
 
 } // namespace gemm

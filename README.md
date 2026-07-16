@@ -26,8 +26,9 @@ basic building block of an inference layer.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
   shared-memory tree reductions); the attention kernels build on it.
 - Attention: a FlashAttention-style kernel (online softmax, no N×N matrix) with
-  an optional causal mask, plus a query-tiled v2 that reuses K/V across a block
-  (up to ~11× over v1 at long sequence length).
+  an optional causal mask, a query-tiled v2 that reuses K/V across a block (up to
+  ~11× over v1), and an FA-2-style warp-partitioned kernel that splits the head
+  dimension across a warp (kills v2's d=128 register spill; 1.6–6× over v2 there).
 
 ## Results
 
@@ -246,6 +247,40 @@ and v2 wins across the board.
 `./build/bench n` prints v1 vs v2 for both table dims (d = 64 and d = 128),
 full and causal.
 
+## Attention FA-2 — warp-partitioned head dim (`flash_attention_fa2_kernel`)
+
+v2 gives a query row to one thread, which holds `q[d]` and `acc[d]` in registers.
+At d=128 that is 256+ floats per thread, over the 255-register limit, so it
+spills (ptxas: 255 registers, ~4 KB of spill traffic per thread). FA-2 gives a
+row to a whole warp instead and splits d across its 32 lanes: lane `l` owns dims
+l, l+32, ..., so at d=128 each lane holds only d/32 = 4 elements of q and acc.
+ptxas then reports 64 registers and 0 spill.
+
+Splitting d breaks one thing: the score `s = <q, k>` is a sum over d, now spread
+across the lanes. Each lane computes its partial dot and a warp butterfly
+(`__shfl_xor`, registers only) reduces the 32 partials into the full score in
+every lane. That is the only cross-lane step. The running softmax scalars (m, l)
+are per-row, so every lane recomputes them identically; and the P·V product is
+lane-independent (each lane accumulates its own output dims). The only reduction
+lives at warp level, never at block level.
+
+Measured on an RTX 3080, `n×n`, full attention, GFLOP/s:
+
+| n    | v2 d=128 | FA-2 d=128 | FA-2/v2 | v2 d=64 | FA-2 d=64 | FA-2/v2 |
+|------|----------|------------|---------|---------|-----------|---------|
+| 1024 | 283      | 1689       | 5.97×   | 504     | 1076      | 2.13×   |
+| 2048 | 526      | 1613       | 3.07×   | 1007    | 1305      | 1.30×   |
+| 4096 | 1038     | 1705       | 1.64×   | 1996    | 1442      | 0.72×   |
+
+At d=128 (a common head dim) FA-2 wins across the board — no spill, and a flat
+~1600-1700 GFLOP/s regardless of n. At d=64, where v2 does not spill, it is a
+trade-off: FA-2 gives a row to a warp, so a block serves only 8 rows against
+v2's 64, meaning each shared K/V tile is reused 8× per block instead of 64×. At
+large n the K/V traffic dominates and v2's higher reuse wins (0.72× at n=4096);
+at small n v2 is block-starved (16 blocks for 68 SMs, wave quantization) while
+FA-2's smaller row tile fills the card, so FA-2 wins. The right kernel depends on
+the regime: FA-2 for d=128, v2 for d≤64 at long sequence length.
+
 ## Build & run
 
 CPU (Linux/GCC, or Windows/MSVC. On MSVC the build forces `/openmp:experimental`:
@@ -318,5 +353,5 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [ ] Baseline: PyTorch SDPA for the attention kernels
 - [ ] GEMM v3: vectorized `float4` loads + double buffering (close the cuBLAS gap)
 - [ ] Fused epilogue on the register-tiled v2 GEMM
-- [ ] Attention: FA-2-style warp-partitioned layout (fixes the d=128 spill)
+- [x] Attention FA-2: warp-partitioned head dim (kills the d=128 spill; 1.6–6× over v2 at d=128)
 - [ ] Multi-device StarPU variant
