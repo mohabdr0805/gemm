@@ -19,7 +19,7 @@ int main() {
 
     std::vector<float> A(M * K), B(K * N), C0(M * N), C1(M * N);
 #ifdef USE_CUDA
-    std::vector<float> C2(M * N), C3(M * N), C4(M * N);
+    std::vector<float> C2(M * N), C3(M * N), C4(M * N), Cseed(M * N);
 #endif
 
     std::mt19937 rng(42);
@@ -30,7 +30,7 @@ int main() {
         float v = dist(rng);
         C0[i] = v; C1[i] = v;
 #ifdef USE_CUDA
-        C2[i] = v; C3[i] = v; C4[i] = v;
+        C2[i] = v; C3[i] = v; C4[i] = v; Cseed[i] = v;
 #endif
     }
 
@@ -81,6 +81,51 @@ int main() {
         err_reg = std::max(err_reg, (double)std::fabs(C0[i] - C3[i]));
     std::printf("Max abs error (reg   vs naive) : %.3e (tol %.1e)\n", err_reg, tol);
     if (err_reg > tol) { std::printf("FAIL (reg)\n"); rc = 1; }
+
+    // v3 (float4 + double buffering). Its fast path needs aligned sizes; the main
+    // M/N/K here is unaligned, so this call exercises v3's fall-back-to-v2 path.
+    // Fresh buffer seeded from the pristine init (C3 was overwritten above), so the
+    // beta term acts on the original C, not on the reg result.
+    std::vector<float> Cfb = Cseed;
+    gemm::gemm_cuda_v3(M, N, K, alpha, A.data(), B.data(), beta, Cfb.data());
+    double err_v3fb = 0.0;
+    for (int i = 0; i < M * N; ++i)
+        err_v3fb = std::max(err_v3fb, (double)std::fabs(C0[i] - Cfb[i]));
+    std::printf("Max abs error (v3 fb vs naive) : %.3e (tol %.1e)\n", err_v3fb, tol);
+    if (err_v3fb > tol) { std::printf("FAIL (v3 fallback)\n"); rc = 1; }
+
+    // v3 fast path (float4 + double buffering) on aligned shapes, with the
+    // file-level alpha/beta and the NaN beta=0 write-only contract. Three K depths
+    // exercise the double-buffer kernel's distinct paths: 256 (32 K-tiles, even),
+    // 24 (3 tiles, odd -> the buffer index ends flipped), and 8 (a single tile ->
+    // prologue only, has_next never fires).
+    auto check_v3_aligned = [&](int m, int n, int k) {
+        std::vector<float> AA(m * k), BB(k * n), Cref(m * n), Cgpu(m * n);
+        for (auto& x : AA) x = dist(rng);
+        for (auto& x : BB) x = dist(rng);
+        for (int i = 0; i < m * n; ++i) { float v = dist(rng); Cref[i] = v; Cgpu[i] = v; }
+        gemm::gemm_naive  (m, n, k, alpha, AA.data(), BB.data(), beta, Cref.data());
+        gemm::gemm_cuda_v3(m, n, k, alpha, AA.data(), BB.data(), beta, Cgpu.data());
+        double e = 0.0;
+        for (int i = 0; i < m * n; ++i) e = std::max(e, (double)std::fabs(Cref[i] - Cgpu[i]));
+        std::printf("Max abs error (v3 aligned k=%3d vs naive) : %.3e (tol %.1e)\n", k, e, tol);
+        if (e > tol) { std::printf("FAIL (v3 aligned k=%d)\n", k); rc = 1; }
+
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+        std::vector<float> Cn(m * n, qnan), Cv(m * n, qnan);
+        gemm::gemm_naive  (m, n, k, 1.0f, AA.data(), BB.data(), 0.0f, Cn.data());
+        gemm::gemm_cuda_v3(m, n, k, 1.0f, AA.data(), BB.data(), 0.0f, Cv.data());
+        double e2 = 0.0; bool fin = true;
+        for (int i = 0; i < m * n; ++i) {
+            if (!std::isfinite(Cv[i])) fin = false;
+            e2 = std::max(e2, (double)std::fabs(Cn[i] - Cv[i]));
+        }
+        std::printf("beta=0, NaN-filled C (v3 aligned k=%3d)   : finite=%s, err %.3e\n", k, fin ? "yes" : "NO", e2);
+        if (!fin || e2 > tol) { std::printf("FAIL (v3 beta0 k=%d)\n", k); rc = 1; }
+    };
+    check_v3_aligned(256, 256, 256); // even K-tile count
+    check_v3_aligned(128, 128,  24); // odd K-tile count -> buffer parity
+    check_v3_aligned(128, 128,   8); // single K-tile -> prologue only, no swap
 
     // cuBLAS baseline vs naive: validates the row-major <-> column-major swap
     // (C^T = B^T A^T) before the benchmark quotes any "% of cuBLAS" number.

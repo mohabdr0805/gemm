@@ -16,6 +16,13 @@ void gemm_cuda(int M, int N, int K, float alpha,
 void gemm_cuda_reg(int M, int N, int K, float alpha,
                    const float* A, const float* B, float beta, float* C);
 
+// GEMM v3: v2 + float4 vectorized global loads, a transposed As tile, and double
+// buffering (the next K-tile's loads are in flight while the current tile
+// computes, hiding global-load latency). Fast path for M,N % 128 == 0 and
+// K % 8 == 0; other shapes fall back to v2. Same result.
+void gemm_cuda_v3(int M, int N, int K, float alpha,
+                  const float* A, const float* B, float beta, float* C);
+
 // cuBLAS SGEMM baseline, same row-major convention (internally computes
 // C^T = B^T * A^T in cuBLAS's column-major world -- the standard swap). Same
 // beta==0 write-only semantics. Validated against the naive oracle like every
@@ -23,9 +30,10 @@ void gemm_cuda_reg(int M, int N, int K, float alpha,
 void gemm_cublas(int M, int N, int K, float alpha,
                  const float* A, const float* B, float beta, float* C);
 
-// Device-timed comparison of v1 (shared-memory tiled) vs v2 (register tiled)
-// vs cuBLAS SGEMM, all back-to-back in the same power state -- so the ratios
-// (% of cuBLAS) are reproducible even when absolute GFLOP/s swing with clocks.
+// Device-timed comparison of v1 (shared-memory tiled), v2 (register tiled), v3
+// (float4, then float4 + double buffering) and cuBLAS SGEMM, all back-to-back in
+// the same power state -- so the ratios (% of cuBLAS) are reproducible even when
+// absolute GFLOP/s swing with clocks. v3 is timed only on its aligned fast path.
 void benchmark_gemm_versions(int M, int N, int K);
 
 // Fused inference epilogue: C = act( alpha*A*B + beta*C + bias[col] ).

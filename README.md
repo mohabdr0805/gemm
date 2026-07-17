@@ -2,11 +2,11 @@
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
-> **TL;DR**: hand-written CUDA SGEMM reaching 54–61% of cuBLAS at n ≥ 2048
-> through shared-memory and register tiling, plus a FlashAttention-style
-> attention kernel that gains up to ~11× from query tiling. Every kernel is
-> validated against a CPU oracle. Device figures are 50-iteration averages on
-> an RTX 3080, with cuBLAS timed in the same run.
+> **TL;DR**: hand-written CUDA SGEMM reaching 74–81% of cuBLAS at n ≥ 2048 through
+> shared-memory tiling, register tiling, and vectorized double-buffered loads
+> (v3), plus a FlashAttention-style attention kernel that gains up to ~11× from
+> query tiling. Every kernel is validated against a CPU oracle. Device figures
+> are 50-iteration averages on an RTX 3080, with cuBLAS timed in the same run.
 
 Optimized GEMM (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, single precision,
 row-major. The repo goes from a naive reference to tuned CPU and GPU kernels and
@@ -22,6 +22,8 @@ basic building block of an inference layer.
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C.
   7–11× over v1 (grows with size), ~44–61% of cuBLAS SGEMM on the same card
   (54–61% at n ≥ 2048; the n=1024 grid underfills the card, see Results).
+- GPU v3: v2 + vectorized `float4` loads and double buffering, each step chosen
+  from a Nsight Compute profile. 74–81% of cuBLAS at n ≥ 2048.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
   shared-memory tree reductions); the attention kernels build on it.
@@ -81,11 +83,10 @@ GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 Register tiling is 7–11× the v1 kernel, and the gap grows with n. The lower
 ~44% at n=1024 is grid underfill, not the kernel: 128×128 tiles produce only 64
 blocks for the 3080's 68 SMs × 2 resident blocks, so the card runs half-empty
-(wave quantization). At the larger sizes v2 sits at ~54–61% of cuBLAS; the rest
-of the gap is what the roadmap items target (vectorized `float4` loads, double
-buffering). `ctest` checks every kernel, cuBLAS included, against the CPU
-oracle (max error ~1e-5, tolerance 1e-3). The benchmark does not check
-correctness.
+(wave quantization). At the larger sizes v2 sits at ~54–61% of cuBLAS; v3 (below)
+closes much of that gap with vectorized loads and double buffering. `ctest`
+checks every kernel, cuBLAS included, against the CPU oracle (max error ~1e-5,
+tolerance 1e-3). The benchmark does not check correctness.
 
 ## CPU — `gemm_tiled`
 
@@ -138,6 +139,52 @@ v1 sits at 100% theoretical occupancy yet runs 11× slower than v2 at a third of
 the occupancy. One output per thread gives too little reuse per load: v1 is
 limited by arithmetic intensity, not occupancy. Past full occupancy, arithmetic
 intensity is the only lever left.
+
+## GPU v3 — `gemm_reg_v3db_kernel` (float4 + double buffering)
+
+v2 sits at ~60% of cuBLAS. Nsight Compute on the v2 kernel at n=4096 (full grid)
+showed where the rest goes: DRAM at only ~11% (so not bandwidth-bound), and the
+top warp stalls were global-load latency (`long_scoreboard`) and shared-load
+bank conflicts, with ~268M shared-load bank conflicts reported. Two changes
+followed, each checked by re-profiling.
+
+First, vectorized `float4` global loads plus a transposed As tile (so the
+compute loop reads contiguous shared rows). This was worth several points of
+cuBLAS, but the re-profile was a useful correction: the bank-conflict count did
+not move (the dominant conflict is on the Bs read, which this did not touch), so
+the gain came from issuing a quarter as many global-load instructions, not from
+the conflicts. It also left global-load latency as the new top stall
+(`long_scoreboard` rose from ~12% to ~16%).
+
+Second, double buffering. Two shared buffers: each step issues the next tile's
+global loads into registers up front (in flight while the current tile is
+computed), then lands them in the other buffer and swaps, so the latency
+overlaps the FMAs instead of stalling in front of them. The prediction was that
+`long_scoreboard` would collapse and large-n throughput would recover, and both
+held: the stall fell from ~16% to ~2%, and v3 reaches 74–81% of cuBLAS at
+n ≥ 2048 (74% at n=4096, 76% at n=2048, 81% at n=3072). At n=1024 it draws level
+with cuBLAS, within a few percent either way across runs: the grid is small
+enough that cuBLAS's own kernel loses its edge.
+
+| stall (n=4096, ncu)        | v2    | v3 float4 | v3 + double-buf |
+|----------------------------|-------|-----------|-----------------|
+| global latency (long_sb)   | 11.8% | 15.5%     | 2.3%            |
+| shared latency (short_sb)  | 2.9%  | 18.0%     | 24.3%           |
+| barrier                    | 9.8%  | 9.3%      | 4.9%            |
+| mio throttle (LSU/bank)    | 7.4%  | 7.1%      | 5.5%            |
+
+Double buffering also trades occupancy for latency hiding: the second shared tile
+doubles shared to 16 KB/block and the prefetch adds registers, so only one block
+fits per SM (occupancy 32% → 17%). It still wins, because hiding the global
+latency is worth more than the lost occupancy (the v1→v2 lesson again). And it
+moves the bottleneck: with `long_scoreboard` gone, the top stall is now
+`short_scoreboard`, the latency of the shared→register reads themselves. That is
+the v4 lever, either prefetching those reads into registers or cutting shared
+traffic with wider register blocking.
+
+The fast path assumes aligned sizes (M,N % 128 == 0, K % 8 == 0, needed for the
+unguarded float4 loads); any other shape falls back to v2. `benchmark_gemm_versions`
+prints v1, v2, v3 (float4), v3 (double-buffered) and cuBLAS.
 
 ## Fused inference epilogue
 
@@ -335,7 +382,7 @@ include/gemm/   headers (gemm_cpu.hpp, gemm_cuda.cuh, activation.hpp,
                 softmax*.hpp/cuh, attention*.hpp/cuh)
 src/            gemm_cpu.cpp (naive + tiled), gemm_cuda.cu (kernels),
                 softmax_{cpu,cuda}, attention_{cpu,cuda}
-benchmarks/     GFLOP/s, v1 vs v2, fusion, softmax, attention benchmarks
+benchmarks/     GFLOP/s, v1/v2/v3 vs cuBLAS, fusion, softmax, attention benchmarks
 tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 ```
 
@@ -351,7 +398,7 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] Attention v2: query tiling (K/V reused across the block, up to ~11× over v1)
 - [x] Baseline: cuBLAS SGEMM, same card, same run (v2 ≈ 44–61%; 54–61% at n ≥ 2048)
 - [ ] Baseline: PyTorch SDPA for the attention kernels
-- [ ] GEMM v3: vectorized `float4` loads + double buffering (close the cuBLAS gap)
+- [x] GEMM v3: vectorized `float4` loads + double buffering (~60% → 74–81% of cuBLAS)
 - [ ] Fused epilogue on the register-tiled v2 GEMM
 - [x] Attention FA-2: warp-partitioned head dim (kills the d=128 spill; 1.6–6× over v2 at d=128)
 - [ ] Multi-device StarPU variant
