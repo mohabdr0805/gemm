@@ -534,6 +534,109 @@ gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
     }
 }
 
+// v5: v4 + conflict-free Bs reads. The ~268M shared-load bank conflicts ncu has
+// reported unchanged since v2 all come from the Bs read: `threadCol * TN`
+// strides a warp's 16 columns by 8 floats, so their reads land on 4 of the 32
+// banks (4-way conflict; the As read is a broadcast, 2 addresses per warp, and
+// contributes none). Fix: split each thread's 8 output columns into two groups
+// of 4, at threadCol*4 and threadCol*4 + BN/2 -- a warp's 16 threads then read
+// 128 CONTIGUOUS floats, covering all 32 banks. Note what does NOT change: the
+// staging, the tile layout in shared, the FMA loop. Only which columns a thread
+// OWNS changes (ownership, not layout), so the epilogue moves with it.
+template <int MIN_BLOCKS>
+__global__ void __launch_bounds__(256, MIN_BLOCKS)
+gemm_reg_v5_kernel(int M, int N, int K, float alpha,
+                   const float* __restrict__ A,
+                   const float* __restrict__ B,
+                   float beta, float* __restrict__ C) {
+    constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+    constexpr int HN = BN / 2; // the two column groups sit half a tile apart
+
+    __shared__ float As[2][BK * BM]; // double-buffered, transposed As[buf][k*BM+m]
+    __shared__ float Bs[2][BK * BN];
+
+    const int blockRow = blockIdx.y * BM;
+    const int blockCol = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int threadCol = tid % (BN / TN);
+    const int threadRow = tid / (BN / TN);
+    const int innerRowA = tid / (BK / 4), innerColA = tid % (BK / 4);
+    const int innerRowB = tid / (BN / 4), innerColB = tid % (BN / 4);
+
+    float acc[TM][TN] = {};
+    float regM[TM], regN[TN];
+
+    // Prologue: stage tile 0 into buffer 0.
+    {
+        const float4 a4 = *reinterpret_cast<const float4*>(
+            &A[(size_t)(blockRow + innerRowA) * K + innerColA * 4]);
+        As[0][(innerColA*4+0)*BM + innerRowA] = a4.x;
+        As[0][(innerColA*4+1)*BM + innerRowA] = a4.y;
+        As[0][(innerColA*4+2)*BM + innerRowA] = a4.z;
+        As[0][(innerColA*4+3)*BM + innerRowA] = a4.w;
+        *reinterpret_cast<float4*>(&Bs[0][innerRowB*BN + innerColB*4]) =
+            *reinterpret_cast<const float4*>(
+                &B[(size_t)innerRowB * N + blockCol + innerColB*4]);
+    }
+    __syncthreads();
+
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const bool has_next = (k0 + BK < K);
+        float4 a_next, b_next;
+        if (has_next) { // issue next tile's global loads NOW (in flight during compute)
+            a_next = *reinterpret_cast<const float4*>(
+                &A[(size_t)(blockRow + innerRowA) * K + (k0 + BK) + innerColA * 4]);
+            b_next = *reinterpret_cast<const float4*>(
+                &B[(size_t)((k0 + BK) + innerRowB) * N + blockCol + innerColB * 4]);
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int i = 0; i < TM; ++i) regM[i] = As[buf][kk*BM + threadRow*TM + i];
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) { // split read: all 32 banks, no conflict
+                regN[j]     = Bs[buf][kk*BN + threadCol*4 + j];
+                regN[4 + j] = Bs[buf][kk*BN + threadCol*4 + HN + j];
+            }
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] += regM[i] * regN[j];
+        }
+
+        if (has_next) { // land the prefetched tile in the other buffer, then swap
+            As[1-buf][(innerColA*4+0)*BM + innerRowA] = a_next.x;
+            As[1-buf][(innerColA*4+1)*BM + innerRowA] = a_next.y;
+            As[1-buf][(innerColA*4+2)*BM + innerRowA] = a_next.z;
+            As[1-buf][(innerColA*4+3)*BM + innerRowA] = a_next.w;
+            *reinterpret_cast<float4*>(&Bs[1-buf][innerRowB*BN + innerColB*4]) = b_next;
+            __syncthreads();
+            buf = 1 - buf;
+        }
+    }
+
+    // Epilogue: acc[i][0..3] holds columns threadCol*4.., acc[i][4..7] the
+    // group HN further right. Two float4 stores per row, both 16B-aligned.
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int gRow = blockRow + threadRow * TM + i;
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const size_t idx = (size_t)gRow * N + blockCol + threadCol * 4 + h * HN;
+            float4 out = { alpha * acc[i][h*4+0], alpha * acc[i][h*4+1],
+                           alpha * acc[i][h*4+2], alpha * acc[i][h*4+3] };
+            if (beta != 0.0f) {
+                const float4 c = *reinterpret_cast<float4*>(&C[idx]);
+                out.x += beta * c.x; out.y += beta * c.y;
+                out.z += beta * c.z; out.w += beta * c.w;
+            }
+            *reinterpret_cast<float4*>(&C[idx]) = out;
+        }
+    }
+}
+
 static bool v3_aligned(int M, int N, int K) { return M % 128 == 0 && N % 128 == 0 && K % 8 == 0; }
 
 void gemm_cuda_v3(int M, int N, int K, float alpha,
@@ -558,23 +661,20 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
     constexpr int BM = 128, BN = 128;
     dim3 block(256);
     dim3 grid(N / BN, M / BM);
-    // Pick the occupancy target from the grid, because neither setting wins
-    // everywhere. <2> pins ptxas under the 128-register cliff and doubles
-    // occupancy, worth ~2 points of cuBLAS once the grid is big enough to use
-    // it. But fitting 128 registers is not free even without spill (ptxas
-    // recomputes addresses it would otherwise keep live), and that cost is paid
-    // per thread whether or not the second block ever lands: with fewer than
-    // 2 blocks/SM of work the scheduler puts one block per SM regardless, so <2>
-    // buys nothing and still charges. Measured at n=1024 (64 blocks, 68 SMs):
-    // <1> 105.6% of cuBLAS, <2> 104.1%, consistently. Hence the crossover at
-    // 2 blocks/SM worth of grid.
+    // Pick the launch_bounds build from the grid, because neither wins
+    // everywhere. For v5 both builds cost 128 registers (the split addressing
+    // is cheaper than v3db's, so the kernel sits on the 2-blocks/SM cliff
+    // naturally), yet the hint still changes ptxas scheduling enough to
+    // measure: <1> is ~3.5 points of cuBLAS ahead at n=1024 (12/12 reps),
+    // <2> ~1 point ahead once the grid can seat 2 blocks/SM (11/12 reps).
+    // Same crossover as v4: 2 blocks/SM worth of grid.
     int dev = 0, smCount = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, dev));
     if ((int)(grid.x * grid.y) >= 2 * smCount)
-        gemm_reg_v3db_kernel<2><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+        gemm_reg_v5_kernel<2><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
     else
-        gemm_reg_v3db_kernel<1><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+        gemm_reg_v5_kernel<1><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -646,16 +746,20 @@ void benchmark_gemm_versions(int M, int N, int K) {
     // Warm-up (the first cuBLAS call also pays its workspace init).
     auto run_v3db = [&]{ gemm_reg_v3db_kernel<1><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
     auto run_v4   = [&]{ gemm_reg_v3db_kernel<2><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    run_v1(); run_v2(); if (v3ok) { run_v3(); run_v3db(); run_v4(); } run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
+    auto run_v5   = [&]{ gemm_reg_v5_kernel<1><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
+    auto run_v5lb = [&]{ gemm_reg_v5_kernel<2><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
+    run_v1(); run_v2(); if (v3ok) { run_v3(); run_v3db(); run_v4(); run_v5(); run_v5lb(); } run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
 
-    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, ib = 0;
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, i6 = 0, i7 = 0, ib = 0;
     const double t1 = bench::ms_per_iter(run_v1, &i1);
     const double t2 = bench::ms_per_iter(run_v2, &i2);
-    double t3 = 0.0, t4 = 0.0, t5 = 0.0;
+    double t3 = 0.0, t4 = 0.0, t5 = 0.0, t6 = 0.0, t7 = 0.0;
     if (v3ok) {
         t3 = bench::ms_per_iter(run_v3,   &i3);
         t4 = bench::ms_per_iter(run_v3db, &i4);
         t5 = bench::ms_per_iter(run_v4,   &i5);
+        t6 = bench::ms_per_iter(run_v5,   &i6);
+        t7 = bench::ms_per_iter(run_v5lb, &i7);
     }
     const double tb = bench::ms_per_iter(run_cb, &ib);
 
@@ -665,9 +769,12 @@ void benchmark_gemm_versions(int M, int N, int K) {
     std::printf("  v2 register      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t2, g2f, 100.0 * g2f / gbf, i2);
     if (v3ok) {
         const double g3f = gflop / (t3 / 1e3), g4f = gflop / (t4 / 1e3), g5f = gflop / (t5 / 1e3);
+        const double g6f = gflop / (t6 / 1e3), g7f = gflop / (t7 / 1e3);
         std::printf("  v3 float4        : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t3, g3f, 100.0 * g3f / gbf, i3);
         std::printf("  v3 float4+2xbuf  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t4, g4f, 100.0 * g4f / gbf, i4);
         std::printf("  v4 +launch_bounds: %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t5, g5f, 100.0 * g5f / gbf, i5);
+        std::printf("  v5 Bs-split      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t6, g6f, 100.0 * g6f / gbf, i6);
+        std::printf("  v5 Bs-split+lb   : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t7, g7f, 100.0 * g7f / gbf, i7);
     }
     std::printf("  cuBLAS SGEMM     : %7.3f ms/iter  %8.2f GFLOP/s                       [%4d it]\n", tb, gbf, ib);
     std::printf("  register-tiling speedup v1->v2 : %.2fx\n", t1 / t2);

@@ -2,13 +2,13 @@
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
-> **TL;DR**: hand-written CUDA SGEMM reaching 79–86% of cuBLAS at n ≥ 2048, and
-> ~104% at n=1024, through shared-memory tiling, register tiling, vectorized
-> double-buffered loads (v3) and an occupancy-tuned build of the same kernel
-> (v4), plus a FlashAttention-style attention kernel that gains up to ~9.2× from
-> query tiling. Every kernel is validated against a CPU oracle. Device figures
-> are measured on an RTX 3080 with locked clocks, over ~200 ms of work per
-> kernel, with cuBLAS timed in the same run.
+> **TL;DR**: hand-written CUDA SGEMM reaching 87–96% of cuBLAS at n ≥ 2048, and
+> ~119% at n=1024, through shared-memory tiling, register tiling, vectorized
+> double-buffered loads and conflict-free shared reads (v5) — each step picked
+> by a Nsight Compute profile — plus a FlashAttention-style attention kernel
+> that gains up to ~9.2× from query tiling. Every kernel is validated against a
+> CPU oracle. Device figures are measured on an RTX 3080 with locked clocks,
+> over ~200 ms of work per kernel, with cuBLAS timed in the same run.
 
 Optimized GEMM (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, single precision,
 row-major. The repo goes from a naive reference to tuned CPU and GPU kernels and
@@ -28,6 +28,9 @@ basic building block of an inference layer.
 - GPU v4: the same kernel pinned at 128 registers with `__launch_bounds__`,
   dispatched on grid size. +2–3 points at n ≥ 2048 — and the profile of what it
   unmasked.
+- GPU v5: conflict-free Bs reads (each thread's columns split into two groups
+  half a tile apart). The ~268M bank conflicts drop to zero, measured; +8–10
+  points everywhere. 87–96% of cuBLAS at n ≥ 2048, ~119% at n=1024.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
   shared-memory tree reductions); the attention kernels build on it.
@@ -94,32 +97,34 @@ section for the MSVC details.
 
 GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 
-| n    | v1 shared-tiled | v2 register | v3 float4+2×buf | v4 launch-bounds | cuBLAS SGEMM | v2 vs cuBLAS | v3 vs cuBLAS | v4 vs cuBLAS |
-|------|-----------------|-------------|-----------------|------------------|--------------|--------------|--------------|--------------|
-| 1024 | 1 515           | 9 070       | 15 117          | 14 789           | 14 489       | ~63%         | **~104%**    | ~102%        |
-| 2048 | 1 537           | 12 498      | 15 722          | 16 380           | 20 631       | ~61%         | ~76%         | ~79%         |
-| 3072 | 1 542           | 12 235      | 16 020          | 16 648           | 19 320       | ~63%         | ~83%         | **~86%**     |
-| 4096 | 1 551           | 12 867      | 16 290          | 16 820           | 21 135       | ~61%         | ~77%         | ~80%         |
+| n    | v1 shared-tiled | v2 register | v3 float4+2×buf | v4 launch-bounds | v5 Bs-split | cuBLAS SGEMM | v2 % | v3 % | v4 % | v5 % |
+|------|-----------------|-------------|-----------------|------------------|-------------|--------------|------|------|------|------|
+| 1024 | 1 517           | 9 021       | 15 145          | 14 810           | 17 301      | 14 525       | ~62% | ~104% | ~102% | **~119%** |
+| 2048 | 1 540           | 12 476      | 15 761          | 16 324           | 18 369      | 20 565       | ~61% | ~77% | ~79% | **~89%** |
+| 3072 | 1 547           | 12 297      | 16 056          | 16 640           | 18 466      | 19 296       | ~64% | ~83% | ~86% | **~96%** |
+| 4096 | 1 551           | 12 865      | 16 283          | 16 815           | 18 460      | 21 110       | ~61% | ~77% | ~80% | **~87%** |
 
-v3 and v4 are the same kernel compiled at two occupancy targets (130 vs 128
-registers, see GPU v4); the shipped `gemm_cuda_v3` dispatches between them on
-grid size, so it takes the better column at every n. v1 sits at 7–10% of cuBLAS;
-register tiling is 6–8.3× over it, and the gap grows with n.
+Every column comes from one run. The v5 column is what the shipped
+`gemm_cuda_v3` launches at that size — the kernel exists in two
+`__launch_bounds__` builds and the wrapper dispatches on grid size, as v4
+introduced (see GPU v4 and v5). v1 sits at 7–10% of cuBLAS; register tiling is
+6–8.3× over it, and the gap grows with n.
 
 Grid underfill at n=1024 is visible in v2's absolute throughput, not in its
 ratio: 128×128 tiles produce 64 blocks, and v2 fits 2 per SM, so it has 136 slots
 for the 3080's 68 SMs and fills fewer than half of them (wave quantization):
-9 070 GFLOP/s against ~12 500 at larger n. The ratio hides it because cuBLAS
-underfills at n=1024 too (14 489, its own worst size).
+9 021 GFLOP/s against ~12 500 at larger n. The ratio hides it because cuBLAS
+underfills at n=1024 too (14 525, its own worst size).
 
-v3 is the interesting row. Its throughput barely moves with n (15.1–16.3
-TFLOP/s), so the "% of cuBLAS" column is mostly a picture of cuBLAS's variation,
-and v3 *beats* cuBLAS at n=1024 for the same reason it costs at n=4096: it needs
-130 registers, so only one block fits per SM (see below), which means 68 slots,
-and n=1024 supplies 64 blocks. The property that halves its occupancy is what
-leaves it nearly full when the grid is small. `ctest` checks every kernel, cuBLAS
-included, against the CPU oracle (max error ~1e-5, tolerance 1e-3). The benchmark
-does not check correctness.
+v3 beats cuBLAS at n=1024 for the same reason it costs at n=4096: it needs 130
+registers, so only one block fits per SM (see below), which means 68 slots, and
+n=1024 supplies 64 blocks. The property that halves its occupancy is what leaves
+it nearly full when the grid is small. And the v5 row says where the remaining
+gap to cuBLAS lives: at n=3072 (a grid that tiles the card evenly) v5 is at 96%;
+the dips to 87–89% at 2048 and 4096 track cuBLAS's own peaks, not a flaw that
+grows with n. `ctest` checks every kernel, cuBLAS included, against the CPU
+oracle (max error ~1e-5, tolerance 1e-3). The benchmark does not check
+correctness.
 
 ## CPU — `gemm_tiled`
 
@@ -166,12 +171,13 @@ raise arithmetic intensity, which is worth more than occupancy at this point.
 | kernel | registers/thread | shared/block | occupancy          | GFLOP/s (n=4096) |
 |--------|------------------|--------------|--------------------|------------------|
 | v1     | 37 (0 spill)     | 2176 B       | 100% (6 blocks/SM) | 1 551            |
-| v2     | 128 (0 spill)    | 8192 B       | 33% (2 blocks/SM)  | 12 867           |
-| v3     | 130 (0 spill)    | 16384 B      | 17% (1 block/SM)   | 16 290           |
-| v4     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 16 820           |
+| v2     | 128 (0 spill)    | 8192 B       | 33% (2 blocks/SM)  | 12 865           |
+| v3     | 130 (0 spill)    | 16384 B      | 17% (1 block/SM)   | 16 283           |
+| v4     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 16 815           |
+| v5     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 18 460           |
 
 Occupancy falls 100% → 33% → 17% down the first three rows while throughput
-rises 1 551 → 12 867 → 16 290. v1 sits at 100% theoretical occupancy yet runs
+rises 1 551 → 12 865 → 16 283. v1 sits at 100% theoretical occupancy yet runs
 8.3× slower than v2 at a third of the occupancy: one output per thread gives too
 little reuse per load, so v1 is limited by arithmetic intensity, not occupancy.
 Past full occupancy, arithmetic intensity is the only lever left; past that,
@@ -183,7 +189,8 @@ on it, and v3's prefetch pushes it to 130. Two registers over, and the second
 block is gone. The 16 KB of shared is not what binds (it would still allow six).
 The v4 row is the same kernel forced back under the cliff with
 `__launch_bounds__` — worth ~3% at this size, and a story of its own (see GPU
-v4).
+v4). The v5 row lands on 128 without being asked: its split addressing is
+cheaper than v3's, so the kernel sits on the cliff naturally.
 
 ## GPU v3 — `gemm_reg_v3db_kernel` (float4 + double buffering)
 
@@ -257,10 +264,52 @@ dispatches on grid size: the 128-register build once the grid can seat two
 blocks per SM, the 130-register build below that. Same kernel, two `ptxas`
 budgets, picked per shape — the FA-2 dispatch argument again, one level down.
 
-Next lever, and the profile has now named it twice: the Bs bank conflicts
-(pad or swizzle the Bs tile).
+Next lever, and the profile had now named it twice: the Bs bank conflicts.
+That is v5, below.
 
-## Fused inference epilogue
+## GPU v5 — `gemm_reg_v5_kernel` (conflict-free Bs reads)
+
+The conflicts have an address. In the compute loop each thread read its 8 output
+columns as one contiguous group at `threadCol * 8`: sixteen threadCols spaced 8
+floats apart land on `(8·tc) mod 32 ∈ {0, 8, 16, 24}` — four of the 32 banks, a
+4-way conflict on every Bs read. A back-of-envelope check says these are the
+conflicts ncu has been counting all along: the kernel issues 67.1M Bs load
+instructions at n=4096, and the counter read 268 435 456 — 4× that, on the
+integer.
+
+The As read never conflicts, which is why the v3 transpose could not move the
+counter: `threadRow` takes only 2 values per warp, so the As read is a
+broadcast. The fix therefore only touches Bs ownership: each thread's 8 columns
+split into two groups of 4, at `threadCol*4` and `threadCol*4 + 64`. A warp's
+sixteen threadCols then read 128 contiguous floats — all 32 banks. Staging,
+tile layout and the FMA loop are untouched; the epilogue moves with the
+ownership.
+
+The prediction, written down before running: the counter drops to zero exactly.
+Measured (ncu, n=4096, kernels confirmed by name):
+
+| ncu, n=4096              | v4          | v5      |
+|--------------------------|-------------|---------|
+| bank conflicts (LD)      | 264 503 296 | **0**   |
+| kernel time              | 7.34 ms     | 6.38 ms |
+| `sm__throughput`         | 65.6%       | 75.4%   |
+| `mio_throttle`           | 17.4%       | 4.7%    |
+| `short_scoreboard`       | 12.0%       | 6.5%    |
+
+Zero, not "near zero". On the bench it is the largest single step since v2:
++8–10 points of cuBLAS at every size (v4 → v5: 79→89 at n=2048, 86→96 at
+n=3072, 80→87 at n=4096, 102→119 at n=1024), reproduced across two runs within
+±0.6 point. v4's bill is paid: the pressure that doubling the warps put on the
+LSU pipe stopped hurting once the pipe stopped replaying conflicts.
+
+Two smaller facts the measurement adds. The split addressing costs 128
+registers where v3's cost 130, so v5 sits on the 2-blocks/SM cliff without
+`__launch_bounds__` — yet the hint still changes scheduling enough to measure,
+~1 point up at n ≥ 2048 and ~3.5 points down at n=1024, so the grid dispatch
+stays. And the staging side keeps a residual 16.5M store conflicts (the
+transposed As scatter), two orders of magnitude below where the load conflicts
+were; with `mio_throttle` at 4.7% the profile now points at `barrier` (8.7%)
+and the remaining shared latency — the cp.async territory of the roadmap.
 
 A linear layer computes `Y = act(X·W + bias)`. Naively that is two kernels: the
 GEMM, then an element-wise pass for bias and activation, which writes the output
@@ -480,8 +529,11 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] GEMM v4: `__launch_bounds__(256,2)` pins ptxas on the 128-register cliff,
       0 spill, occupancy 17% → 33% (+2–3 points at n ≥ 2048; loses 2 on underfilled
       grids, so the wrapper dispatches on grid size)
-- [ ] GEMM v5: the Bs bank conflicts (~268M since v2, now the top stall at 17%
-      `mio_throttle`): pad or swizzle the Bs tile
+- [x] GEMM v5: conflict-free Bs reads (split column ownership; the ~268M conflicts
+      measured at exactly zero). +8–10 points everywhere: 87–96% of cuBLAS at
+      n ≥ 2048, ~119% at n=1024
+- [ ] GEMM v6: `cp.async` staging (Ampere hardware async copy) — the profile now
+      points at `barrier` (8.7%) and residual shared latency
 - [ ] Fused epilogue on the register-tiled v2 GEMM
 - [x] Attention FA-2: warp-partitioned head dim (kills the d=128 spill; 1.7–6× over v2 at d=128)
 - [ ] Multi-device StarPU variant

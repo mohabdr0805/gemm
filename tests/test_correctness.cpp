@@ -108,8 +108,8 @@ int main() {
         gemm::gemm_cuda_v3(m, n, k, alpha, AA.data(), BB.data(), beta, Cgpu.data());
         double e = 0.0;
         for (int i = 0; i < m * n; ++i) e = std::max(e, (double)std::fabs(Cref[i] - Cgpu[i]));
-        std::printf("Max abs error (v3 aligned k=%3d vs naive) : %.3e (tol %.1e)\n", k, e, tol);
-        if (e > tol) { std::printf("FAIL (v3 aligned k=%d)\n", k); rc = 1; }
+        std::printf("Max abs error (v3 aligned %dx%dx%d vs naive) : %.3e (tol %.1e)\n", m, n, k, e, tol);
+        if (e > tol) { std::printf("FAIL (v3 aligned %dx%dx%d)\n", m, n, k); rc = 1; }
 
         const float qnan = std::numeric_limits<float>::quiet_NaN();
         std::vector<float> Cn(m * n, qnan), Cv(m * n, qnan);
@@ -120,12 +120,16 @@ int main() {
             if (!std::isfinite(Cv[i])) fin = false;
             e2 = std::max(e2, (double)std::fabs(Cn[i] - Cv[i]));
         }
-        std::printf("beta=0, NaN-filled C (v3 aligned k=%3d)   : finite=%s, err %.3e\n", k, fin ? "yes" : "NO", e2);
-        if (!fin || e2 > tol) { std::printf("FAIL (v3 beta0 k=%d)\n", k); rc = 1; }
+        std::printf("beta=0, NaN-filled C (v3 aligned %dx%dx%d)   : finite=%s, err %.3e\n", m, n, k, fin ? "yes" : "NO", e2);
+        if (!fin || e2 > tol) { std::printf("FAIL (v3 beta0 %dx%dx%d)\n", m, n, k); rc = 1; }
     };
     check_v3_aligned(256, 256, 256); // even K-tile count
     check_v3_aligned(128, 128,  24); // odd K-tile count -> buffer parity
     check_v3_aligned(128, 128,   8); // single K-tile -> prologue only, no swap
+    // 144 blocks >= 2 blocks/SM x 68 SMs: crosses the wrapper's grid-dispatch
+    // threshold, so this is the only shape here that exercises the
+    // __launch_bounds__(256,2) build. K=24 keeps the naive oracle cheap.
+    check_v3_aligned(1536, 1536, 24);
 
     // cuBLAS baseline vs naive: validates the row-major <-> column-major swap
     // (C^T = B^T A^T) before the benchmark quotes any "% of cuBLAS" number.
