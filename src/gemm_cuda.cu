@@ -432,7 +432,23 @@ __global__ void gemm_reg_v3_kernel(int M, int N, int K, float alpha,
 // loads for the NEXT tile into registers (they fly while we compute the current
 // tile from shared), then store them into the other buffer and swap. The global
 // latency is overlapped with the FMAs instead of stalling in front of them.
-__global__ void gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
+//
+// MIN_BLOCKS is the __launch_bounds__ occupancy target, and it is the whole of
+// v4. Left at 1, ptxas spends 130 registers/thread; two blocks per SM would need
+// regs*256*2 <= 65536, i.e. <= 128, so the kernel misses the cliff by two
+// registers and runs one block per SM (16.7% occupancy). At 2, ptxas fits 128
+// with no spill at all, and occupancy doubles to 32.6%.
+//
+// It is worth +1.5 points of cuBLAS at n >= 2048, and no more, for a reason ncu
+// makes plain: the recovered occupancy did halve the shared-load latency it was
+// aimed at (short_scoreboard 24.3% -> 11.9%), but two blocks per SM also put
+// twice the warps on one LSU pipe, and that pipe is still fighting the ~268M Bs
+// bank conflicts nobody has fixed since v2. mio_throttle triples (5.5% -> 17.4%)
+// and takes over as the top stall. The conflicts were free while global latency
+// dominated; removing the latency is what finally sends the bill.
+template <int MIN_BLOCKS>
+__global__ void __launch_bounds__(256, MIN_BLOCKS)
+gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
                                      const float* __restrict__ A,
                                      const float* __restrict__ B,
                                      float beta, float* __restrict__ C) {
@@ -542,7 +558,23 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
     constexpr int BM = 128, BN = 128;
     dim3 block(256);
     dim3 grid(N / BN, M / BM);
-    gemm_reg_v3db_kernel<<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC); // float4 + double buffering
+    // Pick the occupancy target from the grid, because neither setting wins
+    // everywhere. <2> pins ptxas under the 128-register cliff and doubles
+    // occupancy, worth ~2 points of cuBLAS once the grid is big enough to use
+    // it. But fitting 128 registers is not free even without spill (ptxas
+    // recomputes addresses it would otherwise keep live), and that cost is paid
+    // per thread whether or not the second block ever lands: with fewer than
+    // 2 blocks/SM of work the scheduler puts one block per SM regardless, so <2>
+    // buys nothing and still charges. Measured at n=1024 (64 blocks, 68 SMs):
+    // <1> 105.6% of cuBLAS, <2> 104.1%, consistently. Hence the crossover at
+    // 2 blocks/SM worth of grid.
+    int dev = 0, smCount = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, dev));
+    if ((int)(grid.x * grid.y) >= 2 * smCount)
+        gemm_reg_v3db_kernel<2><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+    else
+        gemm_reg_v3db_kernel<1><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -581,12 +613,11 @@ void gemm_cublas(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// v1, v2, v3 (float4), v3 (float4 + double buffering) and cuBLAS SGEMM, device
-// timing, no transfers. All are timed back-to-back in the same power state, so
-// the RATIOS (v2/v1, % of cuBLAS) are reproducible even though absolute GFLOP/s
-// swing with the card's boost clocks. Each kernel is measured over ~200 ms of
-// work (iteration count printed), not a fixed count -- see time_ms_per_iter.
-// v3 is timed only on its aligned fast path.
+// v1, v2, v3 (float4), v3 (float4 + double buffering), v4 (the 128-register
+// launch_bounds build) and cuBLAS SGEMM, device timing, no transfers, all
+// back-to-back. Each kernel is measured over ~200 ms of work (iteration count
+// printed), not a fixed count -- see bench_timing.cuh. v3/v4 are timed only on
+// the aligned fast path.
 void benchmark_gemm_versions(int M, int N, int K) {
     const float alpha = 1.0f, beta = 0.0f;
     const size_t sa = (size_t)M * K * sizeof(float);
@@ -613,16 +644,18 @@ void benchmark_gemm_versions(int M, int N, int K) {
                                                 N, M, K, &alpha, dB, N, dA, K, &beta, dC, N)); };
 
     // Warm-up (the first cuBLAS call also pays its workspace init).
-    auto run_v3db = [&]{ gemm_reg_v3db_kernel<<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    run_v1(); run_v2(); if (v3ok) { run_v3(); run_v3db(); } run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
+    auto run_v3db = [&]{ gemm_reg_v3db_kernel<1><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
+    auto run_v4   = [&]{ gemm_reg_v3db_kernel<2><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
+    run_v1(); run_v2(); if (v3ok) { run_v3(); run_v3db(); run_v4(); } run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
 
-    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, ib = 0;
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, ib = 0;
     const double t1 = bench::ms_per_iter(run_v1, &i1);
     const double t2 = bench::ms_per_iter(run_v2, &i2);
-    double t3 = 0.0, t4 = 0.0;
+    double t3 = 0.0, t4 = 0.0, t5 = 0.0;
     if (v3ok) {
         t3 = bench::ms_per_iter(run_v3,   &i3);
         t4 = bench::ms_per_iter(run_v3db, &i4);
+        t5 = bench::ms_per_iter(run_v4,   &i5);
     }
     const double tb = bench::ms_per_iter(run_cb, &ib);
 
@@ -631,9 +664,10 @@ void benchmark_gemm_versions(int M, int N, int K) {
     std::printf("  v1 shared-tiled  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t1, g1f, 100.0 * g1f / gbf, i1);
     std::printf("  v2 register      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t2, g2f, 100.0 * g2f / gbf, i2);
     if (v3ok) {
-        const double g3f = gflop / (t3 / 1e3), g4f = gflop / (t4 / 1e3);
+        const double g3f = gflop / (t3 / 1e3), g4f = gflop / (t4 / 1e3), g5f = gflop / (t5 / 1e3);
         std::printf("  v3 float4        : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t3, g3f, 100.0 * g3f / gbf, i3);
         std::printf("  v3 float4+2xbuf  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t4, g4f, 100.0 * g4f / gbf, i4);
+        std::printf("  v4 +launch_bounds: %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t5, g5f, 100.0 * g5f / gbf, i5);
     }
     std::printf("  cuBLAS SGEMM     : %7.3f ms/iter  %8.2f GFLOP/s                       [%4d it]\n", tb, gbf, ib);
     std::printf("  register-tiling speedup v1->v2 : %.2fx\n", t1 / t2);
