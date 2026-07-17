@@ -595,10 +595,46 @@ void gemm_cublas(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
+// Times `run` over enough iterations to cover ~200 ms of GPU work, and returns
+// ms/iter. A single fixed count cannot serve every kernel here: at n=1024 v3
+// runs in 0.13 ms, so 50 iterations measure only 6.5 ms and the ~5 us launch
+// overhead becomes several percent of noise (the v3/cuBLAS ratio swung 87-113%
+// across runs); v1 at n=4096 runs 82 ms, so the same 50 iterations soak the card
+// for 4 s and shift the clocks for whatever is timed next. Giving every kernel
+// the same time window fixes both at once.
+template <class F>
+static double time_ms_per_iter(F&& run, cudaEvent_t s, cudaEvent_t e, int* iters_out) {
+    constexpr double TARGET_MS = 200.0;
+    constexpr int MIN_ITERS = 3, MAX_ITERS = 5000;
+
+    float probe = 0.0f; // one timed iteration to size the loop
+    CUDA_CHECK(cudaEventRecord(s));
+    run();
+    CUDA_CHECK(cudaEventRecord(e));
+    CUDA_CHECK(cudaEventSynchronize(e));
+    CUDA_CHECK(cudaEventElapsedTime(&probe, s, e));
+
+    int iters = (probe > 0.0f) ? (int)(TARGET_MS / probe) : MAX_ITERS;
+    if (iters < MIN_ITERS) iters = MIN_ITERS;
+    if (iters > MAX_ITERS) iters = MAX_ITERS;
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventRecord(s));
+    for (int i = 0; i < iters; ++i) run();
+    CUDA_CHECK(cudaEventRecord(e));
+    CUDA_CHECK(cudaEventSynchronize(e));
+    CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+
+    if (iters_out) *iters_out = iters;
+    return ms / iters;
+}
+
 // v1, v2, v3 (float4), v3 (float4 + double buffering) and cuBLAS SGEMM, device
 // timing, no transfers. All are timed back-to-back in the same power state, so
 // the RATIOS (v2/v1, % of cuBLAS) are reproducible even though absolute GFLOP/s
-// swing with the card's boost clocks. v3 is timed only on its aligned fast path.
+// swing with the card's boost clocks. Each kernel is measured over ~200 ms of
+// work (iteration count printed), not a fixed count -- see time_ms_per_iter.
+// v3 is timed only on its aligned fast path.
 void benchmark_gemm_versions(int M, int N, int K) {
     const float alpha = 1.0f, beta = 0.0f;
     const size_t sa = (size_t)M * K * sizeof(float);
@@ -628,43 +664,28 @@ void benchmark_gemm_versions(int M, int N, int K) {
     auto run_v3db = [&]{ gemm_reg_v3db_kernel<<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
     run_v1(); run_v2(); if (v3ok) { run_v3(); run_v3db(); } run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
 
-    const int iters = 50;
-    cudaEvent_t s, e; float ms1 = 0.f, ms2 = 0.f, ms3 = 0.f, ms4 = 0.f, msb = 0.f;
+    cudaEvent_t s, e;
     CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int i = 0; i < iters; ++i) run_v1();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms1, s, e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int i = 0; i < iters; ++i) run_v2();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms2, s, e));
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, ib = 0;
+    const double t1 = time_ms_per_iter(run_v1, s, e, &i1);
+    const double t2 = time_ms_per_iter(run_v2, s, e, &i2);
+    double t3 = 0.0, t4 = 0.0;
     if (v3ok) {
-        CUDA_CHECK(cudaEventRecord(s));
-        for (int i = 0; i < iters; ++i) run_v3();
-        CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-        CUDA_CHECK(cudaEventElapsedTime(&ms3, s, e));
-        CUDA_CHECK(cudaEventRecord(s));
-        for (int i = 0; i < iters; ++i) run_v3db();
-        CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-        CUDA_CHECK(cudaEventElapsedTime(&ms4, s, e));
+        t3 = time_ms_per_iter(run_v3,   s, e, &i3);
+        t4 = time_ms_per_iter(run_v3db, s, e, &i4);
     }
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int i = 0; i < iters; ++i) run_cb();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&msb, s, e));
+    const double tb = time_ms_per_iter(run_cb, s, e, &ib);
 
     const double gflop = 2.0 * (double)M * N * K / 1e9;
-    const double t1 = ms1 / iters, t2 = ms2 / iters, t3 = ms3 / iters, t4 = ms4 / iters, tb = msb / iters;
     const double g1f = gflop / (t1 / 1e3), g2f = gflop / (t2 / 1e3), gbf = gflop / (tb / 1e3);
-    std::printf("  v1 shared-tiled  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)\n", t1, g1f, 100.0 * g1f / gbf);
-    std::printf("  v2 register      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)\n", t2, g2f, 100.0 * g2f / gbf);
+    std::printf("  v1 shared-tiled  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t1, g1f, 100.0 * g1f / gbf, i1);
+    std::printf("  v2 register      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t2, g2f, 100.0 * g2f / gbf, i2);
     if (v3ok) {
         const double g3f = gflop / (t3 / 1e3), g4f = gflop / (t4 / 1e3);
-        std::printf("  v3 float4        : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)\n", t3, g3f, 100.0 * g3f / gbf);
-        std::printf("  v3 float4+2xbuf  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)\n", t4, g4f, 100.0 * g4f / gbf);
+        std::printf("  v3 float4        : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t3, g3f, 100.0 * g3f / gbf, i3);
+        std::printf("  v3 float4+2xbuf  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t4, g4f, 100.0 * g4f / gbf, i4);
     }
-    std::printf("  cuBLAS SGEMM     : %7.3f ms/iter  %8.2f GFLOP/s\n", tb, gbf);
+    std::printf("  cuBLAS SGEMM     : %7.3f ms/iter  %8.2f GFLOP/s                       [%4d it]\n", tb, gbf, ib);
     std::printf("  register-tiling speedup v1->v2 : %.2fx\n", t1 / t2);
 
     CUBLAS_CHECK(cublasDestroy(h));
