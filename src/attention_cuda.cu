@@ -6,6 +6,7 @@
 // is what lets the whole thing -- scores, softmax and the P*V product -- run in a
 // single fused pass with O(N*d) extra memory instead of O(N*N).
 #include "gemm/attention_cuda.cuh"
+#include "bench_timing.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -479,30 +480,18 @@ void benchmark_attention_versions(int M, int N, int d, bool causal) {
     auto run_v1 = [&]{ flash_attention_kernel<<<M, ATTN_THREADS>>>(M, N, d, scale, dQ, dK, dV, dO, causal); };
     auto run_v2 = [&]{ launch_v2(g2, b2, M, N, d, scale, dQ, dK, dV, dO, causal); };
 
-    run_v1(); run_v2(); CUDA_CHECK(cudaDeviceSynchronize()); // warm-up
-
-    const int iters = 50;
-    cudaEvent_t s, e; float ms1 = 0.f, ms2 = 0.f;
-    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int it = 0; it < iters; ++it) run_v1();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms1, s, e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int it = 0; it < iters; ++it) run_v2();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms2, s, e));
+    int it1 = 0, it2 = 0;
+    const double t1 = bench::ms_per_iter(run_v1, &it1);
+    const double t2 = bench::ms_per_iter(run_v2, &it2);
 
     double gflop = 4.0 * (double)M * N * d / 1e9; // Q*K^T and P*V, 2*M*N*d each
     if (causal) gflop *= 0.5;                      // ~half masked (exact for M==N)
-    const double t1 = ms1 / iters, t2 = ms2 / iters;
-    std::printf("  v1 one-row/block   %s : %7.3f ms/iter   %7.2f GFLOP/s\n",
-                causal ? "causal" : "full  ", t1, gflop / (t1 / 1e3));
-    std::printf("  v2 query-tiled     %s : %7.3f ms/iter   %7.2f GFLOP/s\n",
-                causal ? "causal" : "full  ", t2, gflop / (t2 / 1e3));
+    std::printf("  v1 one-row/block   %s : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n",
+                causal ? "causal" : "full  ", t1, gflop / (t1 / 1e3), it1);
+    std::printf("  v2 query-tiled     %s : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n",
+                causal ? "causal" : "full  ", t2, gflop / (t2 / 1e3), it2);
     std::printf("  query-tiling speedup : %.2fx\n", t1 / t2);
 
-    cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
 }
 
@@ -529,30 +518,18 @@ void benchmark_attention_fa2(int M, int N, int d, bool causal) {
     auto run_v2  = [&]{ launch_v2 (g2, b2, M, N, d, scale, dQ, dK, dV, dO, causal); };
     auto run_fa2 = [&]{ launch_fa2(gf, bf, M, N, d, scale, dQ, dK, dV, dO, causal); };
 
-    run_v2(); run_fa2(); CUDA_CHECK(cudaDeviceSynchronize()); // warm-up
-
-    const int iters = 50;
-    cudaEvent_t s, e; float ms2 = 0.f, msf = 0.f;
-    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int it = 0; it < iters; ++it) run_v2();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms2, s, e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int it = 0; it < iters; ++it) run_fa2();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&msf, s, e));
+    int it2 = 0, itf = 0;
+    const double t2 = bench::ms_per_iter(run_v2,  &it2);
+    const double tf = bench::ms_per_iter(run_fa2, &itf);
 
     double gflop = 4.0 * (double)M * N * d / 1e9;
     if (causal) gflop *= 0.5;
-    const double t2 = ms2 / iters, tf = msf / iters;
-    std::printf("  v2  one-thread/row %s : %7.3f ms/iter   %7.2f GFLOP/s\n",
-                causal ? "causal" : "full  ", t2, gflop / (t2 / 1e3));
-    std::printf("  fa2 one-warp/row   %s : %7.3f ms/iter   %7.2f GFLOP/s\n",
-                causal ? "causal" : "full  ", tf, gflop / (tf / 1e3));
+    std::printf("  v2  one-thread/row %s : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n",
+                causal ? "causal" : "full  ", t2, gflop / (t2 / 1e3), it2);
+    std::printf("  fa2 one-warp/row   %s : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n",
+                causal ? "causal" : "full  ", tf, gflop / (tf / 1e3), itf);
     std::printf("  fa2 vs v2 speedup : %.2fx\n", t2 / tf);
 
-    cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
 }
 

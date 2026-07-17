@@ -2,6 +2,7 @@
 // Holds the shared-memory tiled kernel (v1), the register-tiled kernel (v2),
 // and the fused bias+activation epilogue used for inference.
 #include "gemm/gemm_cuda.cuh"
+#include "bench_timing.cuh"
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h> // vendor baseline: the number our kernels are measured against
@@ -228,30 +229,15 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
         }
     };
 
-    run_fused(); run_two_pass(); // warm-up
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    const int iters = 50;
-    cudaEvent_t s, e; float ms_f = 0.f, ms_u = 0.f;
-    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int i = 0; i < iters; ++i) run_fused();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms_f, s, e));
-
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int i = 0; i < iters; ++i) run_two_pass();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms_u, s, e));
+    int itf = 0, itu = 0;
+    const double tf = bench::ms_per_iter(run_fused,    &itf);
+    const double tu = bench::ms_per_iter(run_two_pass, &itu);
 
     const double gflop = 2.0 * M * N * K / 1e9;
-    const double tf = ms_f / iters, tu = ms_u / iters;
-    std::printf("  fused    : %7.3f ms/iter   %7.2f GFLOP/s\n", tf, gflop / (tf / 1e3));
-    std::printf("  two-pass : %7.3f ms/iter   %7.2f GFLOP/s\n", tu, gflop / (tu / 1e3));
+    std::printf("  fused    : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n", tf, gflop / (tf / 1e3), itf);
+    std::printf("  two-pass : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n", tu, gflop / (tu / 1e3), itu);
     std::printf("  fusion speedup : %.2fx\n", tu / tf);
 
-    cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dbias);
 }
 
@@ -595,40 +581,6 @@ void gemm_cublas(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// Times `run` over enough iterations to cover ~200 ms of GPU work, and returns
-// ms/iter. A single fixed count cannot serve every kernel here: at n=1024 v3
-// runs in 0.13 ms, so 50 iterations measure only 6.5 ms and the ~5 us launch
-// overhead becomes several percent of noise (the v3/cuBLAS ratio swung 87-113%
-// across runs); v1 at n=4096 runs 82 ms, so the same 50 iterations soak the card
-// for 4 s and shift the clocks for whatever is timed next. Giving every kernel
-// the same time window fixes both at once.
-template <class F>
-static double time_ms_per_iter(F&& run, cudaEvent_t s, cudaEvent_t e, int* iters_out) {
-    constexpr double TARGET_MS = 200.0;
-    constexpr int MIN_ITERS = 3, MAX_ITERS = 5000;
-
-    float probe = 0.0f; // one timed iteration to size the loop
-    CUDA_CHECK(cudaEventRecord(s));
-    run();
-    CUDA_CHECK(cudaEventRecord(e));
-    CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&probe, s, e));
-
-    int iters = (probe > 0.0f) ? (int)(TARGET_MS / probe) : MAX_ITERS;
-    if (iters < MIN_ITERS) iters = MIN_ITERS;
-    if (iters > MAX_ITERS) iters = MAX_ITERS;
-
-    float ms = 0.0f;
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int i = 0; i < iters; ++i) run();
-    CUDA_CHECK(cudaEventRecord(e));
-    CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
-
-    if (iters_out) *iters_out = iters;
-    return ms / iters;
-}
-
 // v1, v2, v3 (float4), v3 (float4 + double buffering) and cuBLAS SGEMM, device
 // timing, no transfers. All are timed back-to-back in the same power state, so
 // the RATIOS (v2/v1, % of cuBLAS) are reproducible even though absolute GFLOP/s
@@ -664,17 +616,15 @@ void benchmark_gemm_versions(int M, int N, int K) {
     auto run_v3db = [&]{ gemm_reg_v3db_kernel<<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
     run_v1(); run_v2(); if (v3ok) { run_v3(); run_v3db(); } run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
 
-    cudaEvent_t s, e;
-    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
     int i1 = 0, i2 = 0, i3 = 0, i4 = 0, ib = 0;
-    const double t1 = time_ms_per_iter(run_v1, s, e, &i1);
-    const double t2 = time_ms_per_iter(run_v2, s, e, &i2);
+    const double t1 = bench::ms_per_iter(run_v1, &i1);
+    const double t2 = bench::ms_per_iter(run_v2, &i2);
     double t3 = 0.0, t4 = 0.0;
     if (v3ok) {
-        t3 = time_ms_per_iter(run_v3,   s, e, &i3);
-        t4 = time_ms_per_iter(run_v3db, s, e, &i4);
+        t3 = bench::ms_per_iter(run_v3,   &i3);
+        t4 = bench::ms_per_iter(run_v3db, &i4);
     }
-    const double tb = time_ms_per_iter(run_cb, s, e, &ib);
+    const double tb = bench::ms_per_iter(run_cb, &ib);
 
     const double gflop = 2.0 * (double)M * N * K / 1e9;
     const double g1f = gflop / (t1 / 1e3), g2f = gflop / (t2 / 1e3), gbf = gflop / (tb / 1e3);
@@ -689,7 +639,6 @@ void benchmark_gemm_versions(int M, int N, int K) {
     std::printf("  register-tiling speedup v1->v2 : %.2fx\n", t1 / t2);
 
     CUBLAS_CHECK(cublasDestroy(h));
-    cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 

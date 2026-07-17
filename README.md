@@ -5,7 +5,7 @@
 > **TL;DR**: hand-written CUDA SGEMM reaching 74–83% of cuBLAS at n ≥ 2048, and
 > ~105% at n=1024, through shared-memory tiling, register tiling, and vectorized
 > double-buffered loads (v3), plus a FlashAttention-style attention kernel that
-> gains up to ~11× from query tiling. Every kernel is validated against a CPU
+> gains up to ~9.4× from query tiling. Every kernel is validated against a CPU
 > oracle. Device figures are measured on an RTX 3080 over ~200 ms of work per
 > kernel, with cuBLAS timed in the same run.
 
@@ -29,8 +29,8 @@ basic building block of an inference layer.
   shared-memory tree reductions); the attention kernels build on it.
 - Attention: a FlashAttention-style kernel (online softmax, no N×N matrix) with
   an optional causal mask, a query-tiled v2 that reuses K/V across a block (up to
-  ~11× over v1), and an FA-2-style warp-partitioned kernel that splits the head
-  dimension across a warp (kills v2's d=128 register spill; 1.6–6× over v2 there).
+  ~9.4× over v1), and an FA-2-style warp-partitioned kernel that splits the head
+  dimension across a warp (kills v2's d=128 register spill; 1.6–5.7× over v2 there).
 
 ## Results
 
@@ -243,8 +243,8 @@ Row-wise safe softmax (`out[i,:] = softmax(in[i,:])`, subtracting the row max
 before `exp` so nothing overflows): one block per row, two cooperative tree
 reductions in shared memory (row max, then sum of exp), threads striding over
 rows longer than the block. Memory-bound, so the benchmark reports effective
-bandwidth: ~530 GB/s at 1024² (the 4 MB matrix mostly lives in the 3080's 5 MB
-L2), dropping to ~120–220 GB/s once the matrix is DRAM-resident. The card's
+bandwidth: ~500 GB/s at 1024² (the 4 MB matrix mostly lives in the 3080's 5 MB
+L2), dropping to ~240 GB/s at 4096² once the matrix is DRAM-resident. The card's
 DRAM peak is 760 GB/s, and the kernel's real traffic is ~2.5× the algorithmic
 figure. The kernel exists mostly as a stepping stone to the attention kernels
 below, which reuse its reduction idiom and replace its global softmax with an
@@ -302,15 +302,19 @@ there, because the `K`/`V` reuse more than pays for the spill traffic, but by a
 smaller margin.
 
 The reproducible number here is the v2/v1 speedup: the two kernels are timed
-back-to-back in the same power state, whereas absolute GFLOP/s swings ~2–3×
-with boost clocks. On an RTX 3080 (`sm_86`), `n×n`, full attention, device
-timing:
+back-to-back over equal ~200 ms windows, whereas absolute GFLOP/s moves with the
+card's clock state. Sizing by time matters for the ratio, not just the absolute:
+under the flat 50 iterations this table used to run, v1 (20 ms/iter at n=4096)
+soaked the card for a second before v2 was timed, and the speedup came out ~11×
+against the 9.4× measured here. "Timed in the same power state" was the claim;
+the fixed count was quietly breaking it. On an RTX 3080 (`sm_86`), `n×n`, full
+attention, device timing:
 
 | n    | speedup d=64 | speedup d=128 |
 |------|--------------|---------------|
-| 1024 | ~3×          | ~1.3×         |
-| 2048 | ~5.5–6.3×    | ~2.7–2.8×     |
-| 4096 | ~11×         | ~5.4×         |
+| 1024 | ~2.5×        | ~1.1×         |
+| 2048 | ~4.8×        | ~2.0×         |
+| 4096 | ~9.4×        | ~4.0×         |
 
 The gain grows with n: the longer the sequence, the more each cached `K`/`V`
 tile is reused. d=128 gains less than d=64 because of the register spill. Since
@@ -343,15 +347,15 @@ Measured on an RTX 3080, `n×n`, full attention, GFLOP/s:
 
 | n    | v2 d=128 | FA-2 d=128 | FA-2/v2 | v2 d=64 | FA-2 d=64 | FA-2/v2 |
 |------|----------|------------|---------|---------|-----------|---------|
-| 1024 | 283      | 1689       | 5.97×   | 504     | 1076      | 2.13×   |
-| 2048 | 526      | 1613       | 3.07×   | 1007    | 1305      | 1.30×   |
-| 4096 | 1038     | 1705       | 1.64×   | 1996    | 1442      | 0.72×   |
+| 1024 | 275      | 1573       | 5.71×   | 505     | 1069      | 2.12×   |
+| 2048 | 488      | 1425       | 2.92×   | 1047    | 1275      | 1.22×   |
+| 4096 | 919      | 1505       | 1.64×   | 1886    | 1328      | 0.70×   |
 
-At d=128 FA-2 wins at every size: no spill, and a flat ~1600–1700 GFLOP/s
+At d=128 FA-2 wins at every size: no spill, and a flat ~1400–1600 GFLOP/s
 regardless of n. At d=64, where v2 does not spill, it is a trade-off. FA-2 gives
 a row to a warp, so a block serves only 8 rows against v2's 64, and each shared
 K/V tile is reused 8× per block instead of 64×. At large n the K/V traffic
-dominates, so v2's higher reuse wins (0.72× at n=4096); at small n v2 is
+dominates, so v2's higher reuse wins (0.70× at n=4096); at small n v2 is
 block-starved (16 blocks for 68 SMs, wave quantization) while FA-2's smaller row
 tile fills the card, so FA-2 wins. The right kernel depends on the regime: FA-2
 for d=128, v2 for d≤64 at long sequence length.
@@ -423,7 +427,7 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] Docker + CI/CD (GitHub Actions, image on GHCR)
 - [x] Row-wise softmax kernel (safe softmax: CPU oracle + CUDA)
 - [x] Fused attention kernel (FlashAttention-style, online softmax + causal mask)
-- [x] Attention v2: query tiling (K/V reused across the block, up to ~11× over v1)
+- [x] Attention v2: query tiling (K/V reused across the block, up to ~9.4× over v1)
 - [x] Baseline: cuBLAS SGEMM, same card, same run (v2 ≈ 61–66%)
 - [ ] Baseline: PyTorch SDPA for the attention kernels
 - [x] GEMM v3: vectorized `float4` loads + double buffering (~61% → 74–83% of cuBLAS,
@@ -432,5 +436,5 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
       the 2-blocks/SM cliff is 128, so occupancy 17% → 33%), then v3's new top stall,
       shared latency (`short_scoreboard` 24%)
 - [ ] Fused epilogue on the register-tiled v2 GEMM
-- [x] Attention FA-2: warp-partitioned head dim (kills the d=128 spill; 1.6–6× over v2 at d=128)
+- [x] Attention FA-2: warp-partitioned head dim (kills the d=128 spill; 1.6–5.7× over v2 at d=128)
 - [ ] Multi-device StarPU variant

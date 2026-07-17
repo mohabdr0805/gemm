@@ -5,6 +5,7 @@
 // row. Threads stride over the row, so a row longer than the block is handled
 // in several passes and N need not be a multiple of the block size.
 #include "gemm/softmax_cuda.cuh"
+#include "bench_timing.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -104,25 +105,17 @@ void benchmark_softmax(int M, int N) {
     CUDA_CHECK(cudaMemset(dIn, 0, sz));
 
     auto run = [&]{ softmax_rows_kernel<<<M, SOFTMAX_THREADS>>>(M, N, dIn, dOut); };
-    run(); CUDA_CHECK(cudaDeviceSynchronize()); // warm-up
 
-    const int iters = 50;
-    cudaEvent_t s, e; float ms = 0.f;
-    CUDA_CHECK(cudaEventCreate(&s)); CUDA_CHECK(cudaEventCreate(&e));
-    CUDA_CHECK(cudaEventRecord(s));
-    for (int i = 0; i < iters; ++i) run();
-    CUDA_CHECK(cudaEventRecord(e)); CUDA_CHECK(cudaEventSynchronize(e));
-    CUDA_CHECK(cudaEventElapsedTime(&ms, s, e));
+    int iters = 0;
+    const double t = bench::ms_per_iter(run, &iters);
 
-    const double t = ms / iters;
     // "Effective" bandwidth = algorithmic traffic (one read + one write of M*N)
     // over time. The kernel's real traffic is ~5 M*N accesses (3 passes), so this
     // deliberately understates hardware throughput -- standard convention.
     const double gb = 2.0 * sz / 1e9;
-    std::printf("  softmax %dx%d : %7.3f ms/iter   %7.2f GB/s\n",
-                M, N, t, gb / (t / 1e3));
+    std::printf("  softmax %dx%d : %7.3f ms/iter   %7.2f GB/s  [%4d it]\n",
+                M, N, t, gb / (t / 1e3), iters);
 
-    cudaEventDestroy(s); cudaEventDestroy(e);
     cudaFree(dIn); cudaFree(dOut);
 }
 
