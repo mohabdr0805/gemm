@@ -76,11 +76,12 @@ int main() {
     }
 
 #ifdef USE_CUDA
-    // --- 2) GPU kernel vs CPU oracle -----------------------------------------
-    // Shapes: N > block size (256) -> rows take several strided passes;
-    // N < block size -> idle lanes in the tree reduction (the -FLT_MAX / 0
+    // --- 2) GPU kernels vs CPU oracle ----------------------------------------
+    // Both the 3-pass kernel and the online (2-pass) variant, same shapes, same
+    // tolerance. Shapes: N > block size (256) -> rows take several strided
+    // passes; N < block size -> idle lanes / empty slices (the -FLT_MAX / 0
     // neutral-element path the kernel comments call out); and N == 1 -> each
-    // row's softmax is exactly [1.0].
+    // row's softmax is exactly [1.0]. None a multiple of 256 -> tails exercised.
     {
         const double tol = 1e-3; // same margin as the GEMM tests
         const int shapes[][2] = { {200, 300}, {64, 100}, {5, 1} };
@@ -100,6 +101,14 @@ int main() {
             std::printf("Max abs error (softmax gpu vs oracle, %3dx%3d) : %.3e (tol %.1e)\n",
                         M, N, err, tol);
             if (err > tol) { std::printf("FAIL (softmax cuda %dx%d)\n", M, N); rc = 1; }
+
+            gemm::softmax_rows_online_cuda(M, N, X.data(), Ygpu.data());
+            err = 0.0;
+            for (int i = 0; i < M * N; ++i)
+                err = std::max(err, (double)std::fabs(Yref[i] - Ygpu[i]));
+            std::printf("Max abs error (softmax online vs oracle, %3dx%3d) : %.3e (tol %.1e)\n",
+                        M, N, err, tol);
+            if (err > tol) { std::printf("FAIL (softmax online %dx%d)\n", M, N); rc = 1; }
         }
     }
 #endif
