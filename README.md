@@ -4,8 +4,8 @@
 
 > **TL;DR**: hand-written CUDA SGEMM reaching 87–96% of cuBLAS at n ≥ 2048, and
 > ~119% at n=1024, through shared-memory tiling, register tiling, vectorized
-> double-buffered loads and conflict-free shared reads (v5) — each step picked
-> by a Nsight Compute profile — plus a FlashAttention-style attention kernel
+> double-buffered loads and conflict-free shared reads (v5), each step picked
+> by a Nsight Compute profile, plus a FlashAttention-style attention kernel
 > that gains up to ~9.2× from query tiling. Every kernel is validated against a
 > CPU oracle. Device figures are measured on an RTX 3080 with locked clocks,
 > over ~200 ms of work per kernel, with cuBLAS timed in the same run.
@@ -26,8 +26,8 @@ basic building block of an inference layer.
 - GPU v3: v2 + vectorized `float4` loads and double buffering, each step chosen
   from a Nsight Compute profile. 76–83% of cuBLAS at n ≥ 2048, ~104% at n=1024.
 - GPU v4: the same kernel pinned at 128 registers with `__launch_bounds__`,
-  dispatched on grid size. +2–3 points at n ≥ 2048 — and the profile of what it
-  unmasked.
+  dispatched on grid size. +2–3 points at n ≥ 2048, and it unmasks the next
+  bottleneck.
 - GPU v5: conflict-free Bs reads (each thread's columns split into two groups
   half a tile apart). The ~268M bank conflicts drop to zero, measured; +8–10
   points everywhere. 87–96% of cuBLAS at n ≥ 2048, ~119% at n=1024.
@@ -46,8 +46,10 @@ Windows/MSVC. Methodology: clocks locked (`nvidia-smi -lgc 1710 -lmc 9501`, the
 card's spec boost — low enough that the power limiter never takes over, ~210 W
 against the 370 W cap), each kernel timed over ~200 ms of work after a warm-up,
 with the iteration count sized per kernel from a probe run and printed alongside
-the result, and cuBLAS timed in the same run. Two independent runs of the full
-suite agree within 0.5 point on every ratio and 0.4% on absolute GFLOP/s.
+the result, and cuBLAS timed in the same run. Each figure is one ~200 ms window,
+not a median of N runs; reproducibility was checked by hand (two independent runs
+of the full suite agreed within 0.5 point on every ratio and 0.4% on absolute
+GFLOP/s), not enforced by the harness.
 
 The lock is not decoration; both halves of it were bought with a mistake. This
 README's first numbers came from a session where the card was silently stuck in a
@@ -67,7 +69,10 @@ kernel fixes both.
 runs in its default math mode (plain `cublasSgemm`, no `cublasSetMathMode`), so
 TF32 is disabled and the comparison is like-for-like. Cross-check: cuBLAS
 matches the FP32 CPU oracle to ~7e-6, where TF32's 10-bit mantissa would give
-errors around 1e-3.*
+errors around 1e-3. The baseline is cuBLAS's default heuristic kernel choice via
+`cublasSgemm`, not an exhaustive `cublasLt` algorithm search; that is the field
+standard for this comparison, and it is what sets the ceiling. One card
+(RTX 3080, `sm_86`), one OS; the ratios can move on Ada/Hopper.*
 
 End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 
@@ -105,10 +110,9 @@ GPU kernels vs cuBLAS SGEMM (device timing, no transfers, GFLOP/s):
 | 4096 | 1 551           | 12 865      | 16 283          | 16 815           | 18 460      | 21 110       | ~61% | ~77% | ~80% | **~87%** |
 
 Every column comes from one run. The v5 column is what the shipped
-`gemm_cuda_v3` launches at that size — the kernel exists in two
-`__launch_bounds__` builds and the wrapper dispatches on grid size, as v4
-introduced (see GPU v4 and v5). v1 sits at 7–10% of cuBLAS; register tiling is
-6–8.3× over it, and the gap grows with n.
+`gemm_cuda_v3` launches at that size: the kernel exists in two `__launch_bounds__`
+builds and the wrapper dispatches on grid size (see GPU v4 and v5). v1 sits at
+7–10% of cuBLAS; register tiling is 6–8.3× over it, and the gap grows with n.
 
 Grid underfill at n=1024 is visible in v2's absolute throughput, not in its
 ratio: 128×128 tiles produce 64 blocks, and v2 fits 2 per SM, so it has 136 slots
@@ -188,8 +192,8 @@ The v3 row also shows how sharp the cliff is. Two blocks per SM need
 on it, and v3's prefetch pushes it to 130. Two registers over, and the second
 block is gone. The 16 KB of shared is not what binds (it would still allow six).
 The v4 row is the same kernel forced back under the cliff with
-`__launch_bounds__` — worth ~3% at this size, and a story of its own (see GPU
-v4). The v5 row lands on 128 without being asked: its split addressing is
+`__launch_bounds__`; worth ~3% at this size (see GPU v4). The v5 row lands on
+128 without being asked: its split addressing is
 cheaper than v3's, so the kernel sits on the cliff naturally.
 
 ## GPU v3 — `gemm_reg_v3db_kernel` (float4 + double buffering)
@@ -233,7 +237,7 @@ because hiding the global latency is worth more than the lost occupancy (the
 v1→v2 lesson again). And it moves the bottleneck: with `long_scoreboard` gone the
 top stall is `short_scoreboard`, the latency of the shared→register reads
 themselves, which the halved occupancy no longer covers. Winning those two
-registers back is v4, the last column above and the next section.
+registers back is v4 (next section).
 
 The fast path assumes aligned sizes (M,N % 128 == 0, K % 8 == 0, needed for the
 unguarded float4 loads); any other shape falls back to v2. `benchmark_gemm_versions`
@@ -255,11 +259,11 @@ conflicts untouched since v2. The conflicts were free while latency dominated;
 removing the latency is what finally sends the bill.
 
 At n=1024 v4 *loses* ~2 points, consistently. Squeezing into 128 registers is
-not free even with zero spill — `ptxas` recomputes addresses it would otherwise
-keep live — and that cost is paid per thread whether or not the second block
+not free even with zero spill (`ptxas` recomputes addresses it would otherwise
+keep live), and that cost is paid per thread whether or not the second block
 ever lands. A 64-block grid on 68 SMs runs one block per SM regardless, so v4
 pays without collecting; the first guess was that the extra occupancy would
-simply be harmless there, and the measurement said otherwise. So `gemm_cuda_v3`
+be harmless there, and the measurement said otherwise. So `gemm_cuda_v3`
 dispatches on grid size: the 128-register build once the grid can seat two
 blocks per SM, the 130-register build below that. Same kernel, two `ptxas`
 budgets, picked per shape — the FA-2 dispatch argument again, one level down.
@@ -274,8 +278,7 @@ columns as one contiguous group at `threadCol * 8`: sixteen threadCols spaced 8
 floats apart land on `(8·tc) mod 32 ∈ {0, 8, 16, 24}` — four of the 32 banks, a
 4-way conflict on every Bs read. A back-of-envelope check says these are the
 conflicts ncu has been counting all along: the kernel issues 67.1M Bs load
-instructions at n=4096, and the counter read 268 435 456 — 4× that, on the
-integer.
+instructions at n=4096, and the counter read 268 435 456, exactly 4× that.
 
 The As read never conflicts, which is why the v3 transpose could not move the
 counter: `threadRow` takes only 2 values per warp, so the As read is a
@@ -309,7 +312,7 @@ registers where v3's cost 130, so v5 sits on the 2-blocks/SM cliff without
 stays. And the staging side keeps a residual 16.5M store conflicts (the
 transposed As scatter), two orders of magnitude below where the load conflicts
 were; with `mio_throttle` at 4.7% the profile now points at `barrier` (8.7%)
-and the remaining shared latency — the cp.async territory of the roadmap.
+and the remaining shared latency, which the roadmap's `cp.async` step targets.
 
 A linear layer computes `Y = act(X·W + bias)`. Naively that is two kernels: the
 GEMM, then an element-wise pass for bias and activation, which writes the output
