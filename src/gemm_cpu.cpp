@@ -31,7 +31,7 @@ void gemm_tiled(int M, int N, int K, float alpha,
                 const float* A, const float* B, float beta, float* C) {
     constexpr int BS = 64; // tile size (tune for L1/L2)
 
-    // BLAS contract: A, B and C do not overlap -- and saying so matters. MSVC
+    // BLAS contract: A, B and C do not overlap, and saying so matters: MSVC
     // assumes C[i*N+j] might alias B[k*N+j] and refuses to auto-vectorize the
     // hot j-loop (/Qvec-report C5002, reason 1200) even with these restrict
     // hints, which is why the j-loop below also carries `omp simd`: an explicit

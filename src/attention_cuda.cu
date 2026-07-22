@@ -164,21 +164,11 @@ void flash_attention_cuda(int M, int N, int d, float scale,
 }
 
 // ---------------------------------------------------------------------------
-// v2: query tiling. Where v1 gives one query row to a whole block (so every
-// block re-reads all of K and V), v2 gives a block a *tile* of ATTN2_BR query
-// rows and lets them share each streamed K/V tile -- so K and V are read only
-// M/ATTN2_BR times, not M times. That is the arithmetic-intensity lever, the
-// same v1->v2 story as the GEMM kernels.
-//
-// One thread per query row: each thread keeps its own running softmax (m, l) and
-// output accumulator acc[D] in registers, so there are NO cross-thread reductions
-// -- the rows are independent. The head dim D is a template parameter (dispatched
-// at runtime, like the fused GEMM's activation), so the score/PV loops fully unroll
-// and q[D]/acc[D] stay register-resident -- for D<=64 (ptxas -v: 128 regs at D=32,
-// 218 at D=64, 0 spill). At D=128 the arrays exceed the 255-register/thread limit
-// and spill to local memory (~1 KB/thread); v2 still beats v1 there (the K/V reuse
-// outweighs the spill traffic), just by a smaller margin -- see the README table.
-// K/V tiles live in shared memory, read (broadcast) by all rows in the block.
+// v2: query tiling. A block owns a *tile* of ATTN2_BR query rows that share each
+// streamed K/V tile, cutting K/V reads from M to M/ATTN2_BR (the v1->v2 move of
+// the GEMM kernels). One thread per row keeps its (m, l) and acc[D] in registers,
+// so rows are independent. D is a template parameter (loops unroll); q/acc spill
+// at D=128 (~1 KB/thread), where v2 still beats v1 by a smaller margin.
 template <int D>
 __global__ void flash_attention_v2_kernel(int M, int N, float scale,
                                           const float* __restrict__ Q,
@@ -261,23 +251,13 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
 }
 
 // ---------------------------------------------------------------------------
-// FA-2-style: warp-partitioned head dimension. Where v2 gives a whole query row
-// to ONE thread (which then holds q[D] and acc[D] in registers, and spills at
-// D=128: 256+ floats > 255-register limit), FA-2 gives a row to a WHOLE WARP and
-// splits D across its 32 lanes. Lane `l` owns dims l, l+32, ... so at D=128 each
-// lane holds only D/32 = 4 elements of q and acc -- no spill, ever.
-//
-// Splitting D breaks one thing: the score s = <q, k> is a sum OVER D, now spread
-// across lanes. So each lane computes its partial dot and a warp butterfly
-// reduction (__shfl_xor, registers only, no shared memory) sums the 32 partials
-// into the full score, present in every lane. That is the one cross-lane step.
-// The running softmax scalars (m, l) are per-row, hence warp-uniform -- every
-// lane recomputes them identically, no communication. And the P*V accumulation
-// is embarrassingly parallel: each lane owns its output dims, acc[k] += p*V[..],
-// no reduction at all. FA-2's idea: keep the only reduction at warp level.
-//
-// Requires D % 32 == 0 (true for 32/64/128). A block is ATTN_FA2_WPB warps, so it
-// serves that many query rows and reuses each shared K/V tile across all of them.
+// FA-2-style: a whole warp owns one query row, splitting D across its 32 lanes
+// (lane l owns dims l, l+32, ...), so at D=128 each lane holds 4 elements of
+// q/acc and never spills -- fixing v2's D=128 register spill. The cost: the score
+// <q,k> is a sum over D, now split across lanes, so a warp butterfly (__shfl_xor,
+// registers) recombines the 32 partials. That is the only cross-lane step; (m, l)
+// are per-row and P*V is per-lane. Requires D % 32 == 0; a block is ATTN_FA2_WPB
+// warps sharing each K/V tile.
 template <int D>
 __global__ void flash_attention_fa2_kernel(int M, int N, float scale,
                                            const float* __restrict__ Q,

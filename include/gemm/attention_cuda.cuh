@@ -19,7 +19,7 @@ namespace gemm {
 // O[i, :] = softmax(scale * <Q[i], K^T>)[masked] * V.  Q, K, V, O are distinct.
 // The head dimension d must be <= 128 (the shared-memory tile budget).
 //
-// v1: one block per query row -- simple, but every block re-reads all of K/V.
+// v1: one block per query row; every block re-reads all of K/V.
 void flash_attention_cuda(int M, int N, int d, float scale,
                           const float* Q, const float* K, const float* V,
                           float* O, bool causal);

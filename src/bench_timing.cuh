@@ -3,18 +3,10 @@
 #include <cstdio>
 #include <cstdlib>
 
-// Shared timing helper for every device benchmark in this repo (GEMM, fusion,
-// softmax, attention). Times `run` over enough iterations to cover ~200 ms of
-// GPU work and returns ms/iter, so each kernel is measured over the same window
-// whatever its speed.
-//
-// Why not a fixed count: 50 iterations was both too few and too many. Too few
-// for the fast kernels -- the v3 GEMM at n=1024 runs 0.15 ms, so 50 iterations
-// measured 7 ms and the ~5 us launch overhead became several percent of noise
-// (its % of cuBLAS swung 87-113% between runs; sized by time it sits at 105+/-1).
-// Too many for the slow ones -- v1 at n=4096 runs 100 ms, so the same 50
-// iterations soaked the card for 5 s and moved the clocks under whatever was
-// timed next, which biased the very ratios the benchmark exists to report.
+// Shared timing helper: runs `run` for ~200 ms and returns ms/iter, so every
+// kernel is measured over the same window whatever its speed. A fixed count is
+// too few for fast kernels (launch overhead) and too many for slow ones (clock
+// drift under the next kernel); the README methodology note has the numbers.
 namespace gemm {
 namespace bench {
 

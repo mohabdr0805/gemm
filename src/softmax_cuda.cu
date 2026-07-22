@@ -94,26 +94,10 @@ void softmax_rows_cuda(int M, int N, const float* in, float* out) {
 }
 
 // ---------------------------------------------------------------------------
-// Online (2-pass) variant: same I/O and same one-block-per-row shape as
-// softmax_rows_kernel, but the row max and the exp-sum are FUSED into a single
-// pass over the input -- each thread carries a running (max m_t, normalizer l_t)
-// that is rescaled whenever a larger element appears, via
-// exp(x - m_new) = exp(x - m_old) * exp(m_old - m_new). The exps are never
-// stored, so the write pass recomputes them: 3 memory sweeps (2 reads + 1
-// write) against the 3-pass kernel's 5 (3 reads + 2 writes, since it stores
-// the exps and then rereads them to normalize). Whether that pays depends on
-// where the sweeps are served from: with ~400 resident blocks, rows
-// collectively overflow the 5 MB L2 only past N ~ 3k -- measured 1.06x vs the
-// 3-pass kernel at N=2048 (everything hits L2, both kernels pay the same
-// 2 M*N DRAM bill) but 1.69-1.74x at N=8192/16384. Traffic alone predicts at
-// most 5/3 there; the measured ratio can sit above it because the online
-// kernel also drops one of the two tree reductions (and its barriers), and
-// neither kernel runs at the DRAM roofline, so the time ratio is not pinned
-// by the traffic ratio. Folding two partials (m_a, l_a) + (m_b, l_b)
-// rescales BOTH normalizers by the common max; the per-element update is just
-// that fold with the element seen as the one-element partial (x, 1) -- and the
-// same fold plus an output accumulator is FlashAttention's tile update
-// (attention_cuda.cu).
+// Online (2-pass) softmax: same I/O and one-block-per-row shape as
+// softmax_rows_kernel, but the max and the exp-sum are fused into one pass, so
+// the input is read twice, not three times. Each thread keeps a running
+// (max, normalizer) and rescales it when a larger element appears.
 __global__ void softmax_rows_online_kernel(int M, int N,
                                            const float* __restrict__ in,
                                            float* __restrict__ out) {
@@ -128,11 +112,8 @@ __global__ void softmax_rows_online_kernel(int M, int N,
     __shared__ float red_m[SOFTMAX_THREADS]; // per-thread partial maxima
     __shared__ float red_l[SOFTMAX_THREADS]; // per-thread partial normalizers
 
-    // 1) online partial over this thread's strided slice: (m_t, l_t) advance
-    //    together, l_t being the sum of exp(x - m_t), always shifted by the
-    //    partial's own running max (no exp of a raw value ever overflows). A
-    //    thread with no element (N < nthreads) keeps (-FLT_MAX, 0), the
-    //    neutral element for the fold below.
+    // 1) online partial over this thread's strided slice. A thread with no
+    //    element (N < nthreads) keeps (-FLT_MAX, 0), the fold's neutral element.
     float m_t = -FLT_MAX;
     float l_t = 0.0f;
     for (int j = tid; j < N; j += nthreads) {
@@ -144,11 +125,8 @@ __global__ void softmax_rows_online_kernel(int M, int N,
     red_l[tid] = l_t;
     __syncthreads(); // publish every partial before the tree reads them in pairs
 
-    // 2) tree reduction, log2 depth -- same shape as the 3-pass kernel's trees,
-    //    but a single one (the pair operator folds max AND normalizer at once,
-    //    rescaling both sides by the common max). One barrier per level:
-    //    publish before the next level reads. After the last level red_m[0] /
-    //    red_l[0] hold the row's global (m, l).
+    // 2) tree reduction: the pair operator folds max and normalizer together,
+    //    rescaling both sides by the common max. One barrier per level.
     for (int s = nthreads >> 1; s > 0; s >>= 1) {
         if (tid < s) {
             const float m_new = fmaxf(red_m[tid], red_m[tid + s]);
@@ -159,9 +137,8 @@ __global__ void softmax_rows_online_kernel(int M, int N,
         __syncthreads();
     }
 
-    // 3) second pass over the input: y = exp(x - m) / l. One reciprocal, then
-    //    multiplies (the same inv_sum trick as above). We read x[j] then write
-    //    y[j] (same index), so in and out may alias, like the 3-pass kernel.
+    // 3) write pass: y = exp(x - m) / l. Reads x[j] then writes y[j], so in and
+    //    out may alias.
     const float inv_sum = 1.0f / red_l[0];
     for (int j = tid; j < N; j += nthreads)
         y[j] = expf(x[j] - red_m[0]) * inv_sum;

@@ -426,26 +426,11 @@ __global__ void gemm_reg_v3_kernel(int M, int N, int K, float alpha,
     }
 }
 
-// v3 + double buffering. ncu showed the top stall after float4 was
-// long_scoreboard (global-load latency) with DRAM still low -- latency, not
-// bandwidth. Fix: two shared buffers. At the top of each step we issue the global
-// loads for the NEXT tile into registers (they fly while we compute the current
-// tile from shared), then store them into the other buffer and swap. The global
-// latency is overlapped with the FMAs instead of stalling in front of them.
-//
-// MIN_BLOCKS is the __launch_bounds__ occupancy target, and it is the whole of
-// v4. Left at 1, ptxas spends 130 registers/thread; two blocks per SM would need
-// regs*256*2 <= 65536, i.e. <= 128, so the kernel misses the cliff by two
-// registers and runs one block per SM (16.7% occupancy). At 2, ptxas fits 128
-// with no spill at all, and occupancy doubles to 32.6%.
-//
-// It is worth +1.5 points of cuBLAS at n >= 2048, and no more, for a reason ncu
-// makes plain: the recovered occupancy did halve the shared-load latency it was
-// aimed at (short_scoreboard 24.3% -> 11.9%), but two blocks per SM also put
-// twice the warps on one LSU pipe, and that pipe is still fighting the ~268M Bs
-// bank conflicts nobody has fixed since v2. mio_throttle triples (5.5% -> 17.4%)
-// and takes over as the top stall. The conflicts were free while global latency
-// dominated; removing the latency is what finally sends the bill.
+// v3 + double buffering: each step prefetches the next tile into registers while
+// computing the current one from shared, then swaps, overlapping load latency
+// with the FMAs. MIN_BLOCKS is the launch_bounds occupancy target -- at 1, ptxas
+// uses 130 registers (one block/SM); forcing 2 pins it to the 128-register cliff,
+// no spill, occupancy doubled. Details in the v4 README section.
 template <int MIN_BLOCKS>
 __global__ void __launch_bounds__(256, MIN_BLOCKS)
 gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
