@@ -21,16 +21,11 @@ CTestTestfile.cmake
 *.pdb
 *.ilk
 
-# IDE / tools
-.vs/
-.vscode/
-.idea/
-.claude/
-
 # OS
 Thumbs.db
 .DS_Store
 
-# Personal handoff notes and local build helper (kept out of the public repo)
-HANDOFF.md
+# Local build helper: hardcoded paths to this machine's Visual Studio / CUDA
+# install, so it is not portable. The portable recipe is the cmake invocation
+# documented in the README.
 build.bat
