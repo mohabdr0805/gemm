@@ -18,7 +18,7 @@ basic building block of an inference layer.
 ## Contents
 
 - CPU: naive reference + cache-tiled, OpenMP-parallel, SIMD-vectorized version
-  (~90× naive; 209 GFLOP/s at n=4096 on a 12700F).
+  (~214× naive; ~200 GFLOP/s at n ≥ 2048 on a 12700F).
 - GPU v1: shared-memory tiled kernel (coalesced loads, bank-conflict padding,
   border handling).
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C.
@@ -78,9 +78,20 @@ End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 
 | n    | naive | CPU tiled (OpenMP+SIMD) | GPU v1 wrapper |
 |------|-------|-------------------------|----------------|
-| 1024 | 0.90  | 83                      | 618            |
-| 2048 | —     | 161                     | 917            |
-| 4096 | —     | 209                     | 1 162          |
+| 1024 | 0.88  | 188                     | 618            |
+| 2048 | —     | 202                     | 917            |
+| 4096 | —     | 198                     | 1 162          |
+
+*The CPU column replaces an earlier 83 / 161 / 209, under two separate causes.
+(1) `gemm_tiled` used to carry `collapse(2)`, which MSVC silently ignores
+(warning C4849 on every build), so only the `ii` loop was parallel; fusing the two
+tile loops by hand gives +29% at n=2048, +18% at n=1024 and +6% at n=4096,
+measured A/B at identical flags, bit-identical results. (2) The host benchmark now
+reports the best of several runs instead of a single shot: at n=1024 the whole
+GEMM takes ~20 ms, and one measurement swings by a factor of two on fork/join
+alone (~97 GFLOP/s single shot against ~188 best-of-five, same binary). So most of
+the 83 → 188 at n=1024 is (2), most of the 161 → 202 at n=2048 is (1), and at
+n=4096 the figure moves **down**, 209 → 198: the old single shot was a lucky one.*
 
 *Footnote: the end-to-end row is one timed call including `cudaMalloc` and both
 transfers, so it measures the wrapper, not the kernel. It climbs with n while the
@@ -88,8 +99,9 @@ bare v1 kernel below is flat (~1 540 GFLOP/s), because the copies scale as n² a
 the kernel as n³: at n=1024 the transfers cost more than the kernel itself (618
 vs 1 515), by n=4096 they are mostly amortised away (1 162 vs 1 551).*
 
-CPU tiled is ~90× the naive version at n=1024 and reaches 209 GFLOP/s at
-n=4096, about 16% of the 12700F's AVX2 peak, with no cache cliff. The
+CPU tiled is ~214× the naive version at n=1024 (same n on both sides) and reaches
+~200 GFLOP/s from n=2048 on, about 15% of the 12700F's AVX2 peak, with no cache
+cliff. The
 three-level blocking explains it: at any instant a thread touches only three
 64×64 sub-blocks (3 × 16 KB, L1-resident at any n), so growing n only adds
 bandwidth pressure from panel re-streaming: 172 GFLOP/s at n=6144, 154 at
@@ -132,9 +144,19 @@ correctness.
 
 ## CPU — `gemm_tiled`
 
-C is split into 64×64 tiles to fit in cache. `#pragma omp parallel for collapse(2)`
-hands one whole tile to each thread, so there is no data race and no reduction. The
-inner i-k-j order keeps B and C accessed row by row.
+C is split into 64×64 tiles to fit in cache, and one whole tile goes to one
+thread, so there is no data race and no reduction. The inner i-k-j order keeps B
+and C accessed row by row.
+
+The two tile loops are **fused by hand** into a single loop over the tile index
+instead of carrying `collapse(2)`. MSVC needs `/openmp:experimental` for the
+`omp simd` below; that mode is OpenMP 2.0 + simd and it ignores `collapse`, saying
+so on every build (`warning C4849`). Only the `ii` loop was parallel: M/64
+iterations to fill 20 threads. The binary also linked `VCOMP140.DLL`, the
+OpenMP 2.0 runtime, which is the same fact from the other side.
+`/openmp:llvm` honours `collapse` but rejects `omp simd` (`error C7660`), so no
+single MSVC flag buys both. Fusing needs no clause at all, works on every
+compiler, and gives +29% at n=2048 (see the table footnote above).
 
 Row access is only half the point of that loop order; the other half is SIMD.
 The inner `Crow[j] += a * Brow[j]` over contiguous floats maps onto 8-wide AVX2
@@ -348,6 +370,39 @@ figure. The kernel exists mostly as a stepping stone to the attention kernels
 below, which reuse its reduction idiom and replace its global softmax with an
 online one.
 
+### The online (2-pass) variant, and why its gain hides
+
+`softmax_rows_online_kernel` fuses the max pass into the sum pass with the same
+`exp(m_old − m_new)` rescale the attention kernels use, so the input is read
+twice instead of three times: 3·M·N accesses against 5, a ceiling of 5/3 ≈ 1.67×.
+The reduction folds `(m, l)` pairs in one tree instead of two.
+
+Measured, it delivers, but only past a threshold:
+
+| n × n  | re-read working set | 3-pass  | online  | speedup |
+|--------|---------------------|---------|---------|---------|
+| 2 048  | 3.2 MB (< L2)       | 357 GB/s| 385 GB/s| 1.08×   |
+| 4 096  | 6.5 MB              | 191     | 282     | 1.48×   |
+| 8 192  | 13 MB               | 158     | 267     | **1.69×** |
+| 16 384 | 26 MB               | 160     | 266     | 1.66×   |
+
+What has to overflow the 3080's 5 MB L2 is not the matrix but what is re-read
+*concurrently*: ~408 resident blocks (6/SM × 68 SM) × one n-float row, so the
+crossover sits at n\* ≈ 5 MB / (408 × 4 B) ≈ 3 200. Below it, every re-read is an
+L2 hit and both kernels pay only the incompressible 2·M·N of DRAM traffic (the
+first read of `x`, the write of `y`), so they are indistinguishable and the 5/3
+model predicts a gain that does not exist. Above it the model becomes exact.
+
+Two things this cost. The first draft folded the 256 partials on **one** thread
+instead of a tree: correct, 40% less traffic, and *slower than the 3-pass*
+(0.71× at 2048², 0.41× at 2048×1024). The serial fold is 255 of the ~271
+sequential steps on a block's critical path, ~94%, and it does not shrink with n,
+so halving n makes the penalty worse. And the benchmark itself used to sample only
+`(n, n)` and `(n, 1024)`, both below n\* at the usual n, which made a 1.69× kernel
+read as 0.98× and nearly got it written off. Less algorithmic traffic only becomes
+speed if the traffic you removed was not already being served by cache; it is also
+why attention, which never fits, wins unconditionally.
+
 ## FlashAttention v1 — `flash_attention_kernel`
 
 Attention is `O = softmax(scale · Q·Kᵀ) · V`. Done literally, that builds the
@@ -459,10 +514,10 @@ for d=128, v2 for d≤64 at long sequence length.
 
 ## Build & run
 
-CPU (Linux/GCC, or Windows/MSVC. On MSVC the build forces `/openmp:experimental`:
-the LLVM OpenMP runtime, so the tiled GEMM's `collapse(2)` is actually
-parallelized (classic `/openmp` is stuck at OpenMP 2.0 and silently ignores it),
-plus the `omp simd` directive the inner loop needs to vectorize):
+CPU (Linux/GCC, or Windows/MSVC. On MSVC the build forces `/openmp:experimental`
+for one reason: it is the only mode that accepts the `omp simd` directive the
+tiled GEMM's inner loop needs to vectorize. It does not support `collapse`, so the
+tile loops are fused by hand instead; see the `gemm_tiled` section):
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
@@ -523,6 +578,8 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 - [x] Fused inference epilogue (bias + activation)
 - [x] Docker + CI/CD (GitHub Actions, image on GHCR)
 - [x] Row-wise softmax kernel (safe softmax: CPU oracle + CUDA)
+- [x] Softmax: online (2-pass) variant: 1.69× over the 3-pass kernel above the L2
+      crossover (n\* ≈ 3 200), indistinguishable below it
 - [x] Fused attention kernel (FlashAttention-style, online softmax + causal mask)
 - [x] Attention v2: query tiling (K/V reused across the block, up to ~9.2× over v1)
 - [x] Baseline: cuBLAS SGEMM, same card, same run (v2 ≈ 61–63%)

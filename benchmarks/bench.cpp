@@ -6,6 +6,7 @@
 #endif
 #include <vector>
 #include <functional>
+#include <algorithm>
 #include <cstdlib>
 #include <random>
 #include <chrono>
@@ -40,11 +41,15 @@ int main(int argc, char** argv) {
         std::printf("naive : (skipped, too slow for n > 1024)\n");
     }
 
-    // Warm-up: the first OpenMP region pays the thread-pool spin-up, which would
-    // otherwise be billed to the timed run (same discipline as the device benches).
+    // Warm-up (the first OpenMP region pays the thread-pool spin-up), then
+    // best-of-R rather than a single shot: at n=1024 the GEMM runs in ~20 ms,
+    // short enough that one measurement swings twofold on fork/join alone.
     gemm::gemm_tiled(n, n, n, alpha, A.data(), B.data(), beta, C.data());
-    double t = seconds([&]{ gemm::gemm_tiled(n, n, n, alpha, A.data(), B.data(), beta, C.data()); });
-    std::printf("tiled : %8.3f s   %7.2f GFLOP/s\n", t, flops / t / 1e9);
+    const int reps = (n <= 2048) ? 5 : 3; // keep the wall-clock sane at large n
+    double t = 1e30;
+    for (int r = 0; r < reps; ++r)
+        t = std::min(t, seconds([&]{ gemm::gemm_tiled(n, n, n, alpha, A.data(), B.data(), beta, C.data()); }));
+    std::printf("tiled : %8.3f s   %7.2f GFLOP/s  [best of %d]\n", t, flops / t / 1e9, reps);
 
 #ifdef USE_CUDA
     gemm::gemm_cuda(n, n, n, alpha, A.data(), B.data(), beta, C.data()); // warm-up (context init)
@@ -67,10 +72,13 @@ int main(int argc, char** argv) {
         gemm::benchmark_fusion(s[0], s[1], s[2], gemm::Activation::GELU);
     }
 
-    // Softmax (row-wise): memory-bound, so the figure of merit is bandwidth.
+    // Softmax (row-wise): memory-bound, so the figure of merit is bandwidth. The
+    // 8192 row is fixed rather than derived from `n`: the online kernel only
+    // separates from the 3-pass one above the L2 crossover, n* ~ 3200 (README).
     std::printf("\n[Softmax row-wise]  device timing (no transfers)\n");
     gemm::benchmark_softmax(n, n);
     gemm::benchmark_softmax(n, 1024);
+    gemm::benchmark_softmax(8192, 8192);
 
     // Attention (FlashAttention-style): fused scores + softmax + P*V in one pass,
     // never materializing the n x n score matrix. v1 (one query row per block) vs
