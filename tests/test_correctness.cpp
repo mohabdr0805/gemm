@@ -161,6 +161,44 @@ int main() {
     check_fused(gemm::Activation::GELU, "GELU", bias.data());
     check_fused(gemm::Activation::None, "None", nullptr); // pure GEMM through the fused path
 
+    // Degenerate shapes, which reference BLAS accepts: M==0 and N==0 are no-ops,
+    // K==0 means C = beta*C. Both used to abort or read out of bounds, so every
+    // entry point is checked, K==0 against both beta values.
+    {
+        std::vector<float> Adeg(1, 1.0f), Bdeg(1, 1.0f);
+        const int m = 128, nn = 128; // 128-aligned: exercises v3's FAST path at K=0
+        bool deg_ok = true;
+
+        // M==0 / N==0: must return without touching anything or aborting.
+        gemm::gemm_cuda        (0, nn, 8, alpha, Adeg.data(), Bdeg.data(), beta, nullptr);
+        gemm::gemm_cuda_reg    (m,  0, 8, alpha, Adeg.data(), Bdeg.data(), beta, nullptr);
+        gemm::gemm_cuda_v3     (0,  0, 8, alpha, Adeg.data(), Bdeg.data(), beta, nullptr);
+        gemm::gemm_cublas      (0, nn, 8, alpha, Adeg.data(), Bdeg.data(), beta, nullptr);
+        gemm::gemm_bias_act_cuda(m, 0, 8, alpha, Adeg.data(), Bdeg.data(), beta, nullptr,
+                                 nullptr, gemm::Activation::ReLU);
+
+        // K==0, beta==0 -> C is write-only, so it must come back exactly zero
+        // whatever it held before (here NaN, which 0*NaN would propagate).
+        const float qnan = std::numeric_limits<float>::quiet_NaN();
+        using gemm_fn = void (*)(int, int, int, float, const float*, const float*, float, float*);
+        const gemm_fn fns[]  = { gemm::gemm_cuda, gemm::gemm_cuda_reg,
+                                 gemm::gemm_cuda_v3, gemm::gemm_cublas };
+        const char*   nms[]  = { "cuda", "reg", "v3", "cublas" };
+        for (int f = 0; f < 4; ++f) {
+            std::vector<float> Cz((size_t)m * nn, qnan);
+            fns[f](m, nn, 0, alpha, Adeg.data(), Bdeg.data(), 0.0f, Cz.data());
+            for (size_t i = 0; i < Cz.size(); ++i)
+                if (Cz[i] != 0.0f) { deg_ok = false; break; }
+            // K==0, beta!=0 -> C = beta*C, applied exactly.
+            std::vector<float> Cb((size_t)m * nn, 2.0f);
+            fns[f](m, nn, 0, alpha, Adeg.data(), Bdeg.data(), 0.5f, Cb.data());
+            for (size_t i = 0; i < Cb.size(); ++i)
+                if (Cb[i] != 1.0f) { deg_ok = false; break; }
+            if (!deg_ok) { std::printf("FAIL (degenerate %s)\n", nms[f]); rc = 1; break; }
+        }
+        std::printf("degenerate shapes (M=0, N=0, K=0 x beta) : %s\n", deg_ok ? "OK" : "NO");
+    }
+
     // BLAS beta==0 semantics on the GPU: C is write-only, so NaN-filled C must
     // not leak into the result (0*NaN would). Also proves the wrappers skip the
     // C upload without breaking anything.

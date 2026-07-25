@@ -8,6 +8,7 @@
 #include <cublas_v2.h> // vendor baseline: the number our kernels are measured against
 #include <cstdio>
 #include <cstdlib>
+#include <cstring> // std::memset, for the beta==0 quick return
 
 #define TILE 16
 
@@ -32,6 +33,20 @@
     } while (0)
 
 namespace gemm {
+
+// BLAS quick return, shared by the wrappers below: M == 0 and N == 0 are no-ops,
+// K == 0 is C = beta*C. Neither can reach a kernel. A zero grid dimension is a
+// launch error, and the v3/v5 prologue stages its first K-tile unconditionally,
+// so at K == 0 it would read a float4 past a zero-byte A. C is a host buffer
+// here, so K == 0 is a host-side scaling.
+static bool gemm_quick_return(int M, int N, int K, float beta, float* C) {
+    if (M <= 0 || N <= 0) return true;   // empty C, nothing to write
+    if (K > 0) return false;             // real work to do
+    const size_t n = (size_t)M * N;
+    if (beta == 0.0f) std::memset(C, 0, n * sizeof(float)); // C is write-only
+    else for (size_t i = 0; i < n; ++i) C[i] *= beta;
+    return true;
+}
 
 // v1: shared-memory tiled. As/Bs padded to TILE+1 to dodge bank conflicts.
 __global__ void gemm_kernel(int M, int N, int K, float alpha,
@@ -126,6 +141,7 @@ __global__ void bias_act_kernel(int M, int N, float* __restrict__ C,
 
 void gemm_cuda(int M, int N, int K, float alpha,
                const float* A, const float* B, float beta, float* C) {
+    if (gemm_quick_return(M, N, K, beta, C)) return;
     const size_t sa = (size_t)M * K * sizeof(float);
     const size_t sb = (size_t)K * N * sizeof(float);
     const size_t sc = (size_t)M * N * sizeof(float);
@@ -167,6 +183,18 @@ static void launch_fused(dim3 grid, dim3 block, int M, int N, int K, float alpha
 void gemm_bias_act_cuda(int M, int N, int K, float alpha,
                         const float* A, const float* B, float beta, float* C,
                         const float* bias, Activation act) {
+    // Same quick return, except the epilogue still applies at K == 0.
+    if (M <= 0 || N <= 0) return;
+    if (K <= 0) {
+        for (int i = 0; i < M; ++i)
+            for (int j = 0; j < N; ++j) {
+                const size_t idx = (size_t)i * N + j;
+                float v = (beta == 0.0f) ? 0.0f : beta * C[idx];
+                if (bias) v += bias[j];
+                C[idx] = apply_act(act, v);
+            }
+        return;
+    }
     const size_t sa = (size_t)M * K * sizeof(float);
     const size_t sb = (size_t)K * N * sizeof(float);
     const size_t sc = (size_t)M * N * sizeof(float);
@@ -320,6 +348,7 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
 
 void gemm_cuda_reg(int M, int N, int K, float alpha,
                    const float* A, const float* B, float beta, float* C) {
+    if (gemm_quick_return(M, N, K, beta, C)) return;
     const size_t sa = (size_t)M * K * sizeof(float);
     const size_t sb = (size_t)K * N * sizeof(float);
     const size_t sc = (size_t)M * N * sizeof(float);
@@ -626,6 +655,7 @@ static bool v3_aligned(int M, int N, int K) { return M % 128 == 0 && N % 128 == 
 
 void gemm_cuda_v3(int M, int N, int K, float alpha,
                   const float* A, const float* B, float beta, float* C) {
+    if (gemm_quick_return(M, N, K, beta, C)) return; // before v3_aligned: K==0 passes K%8==0
     if (!v3_aligned(M, N, K)) { // unguarded float4 needs aligned tiles -> fall back to v2
         gemm_cuda_reg(M, N, K, alpha, A, B, beta, C);
         return;
@@ -674,6 +704,7 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
 // no copies. Same beta==0 write-only semantics as the rest of the repo.
 void gemm_cublas(int M, int N, int K, float alpha,
                  const float* A, const float* B, float beta, float* C) {
+    if (gemm_quick_return(M, N, K, beta, C)) return;
     const size_t sa = (size_t)M * K * sizeof(float);
     const size_t sb = (size_t)K * N * sizeof(float);
     const size_t sc = (size_t)M * N * sizeof(float);
