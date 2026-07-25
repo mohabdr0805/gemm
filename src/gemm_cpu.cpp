@@ -51,27 +51,32 @@ void gemm_tiled(int M, int N, int K, float alpha,
             Cr[idx] = (beta == 0.0f) ? 0.0f : beta * Cr[idx];
         }
 
-    // 2) Blocked product. collapse(2) spreads the (ii,jj) tiles over the threads.
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int ii = 0; ii < M; ii += BS) {
-        for (int jj = 0; jj < N; jj += BS) {
-            const int i_max = std::min(ii + BS, M);
-            const int j_max = std::min(jj + BS, N);
-            for (int kk = 0; kk < K; kk += BS) {
-                const int k_max = std::min(kk + BS, K);
-                for (int i = ii; i < i_max; ++i) {
-                    for (int k = kk; k < k_max; ++k) {
-                        const float a = alpha * Ar[(size_t)i * K + k];
-                        // Row pointers hoisted out of the loop: MSVC's
-                        // vectorizer gives up on the mixed (size_t)i*N + j
-                        // addressing, but Crow[j] += a * Brow[j] over plain int
-                        // j is the canonical pattern every vectorizer handles.
-                        float*       __restrict Crow = Cr + (size_t)i * N;
-                        const float* __restrict Brow = Br + (size_t)k * N;
-                        #pragma omp simd
-                        for (int j = jj; j < j_max; ++j) {
-                            Crow[j] += a * Brow[j];
-                        }
+    // 2) Blocked product, one thread per (ii,jj) tile of C. The two tile loops are
+    //    fused into one instead of carrying collapse(2), which MSVC ignores under
+    //    /openmp:experimental (warning C4849), leaving only ii parallel.
+    const int ntiles_j = (N + BS - 1) / BS;
+    const int ntiles   = ((M + BS - 1) / BS) * ntiles_j;
+
+    #pragma omp parallel for schedule(static)
+    for (int t = 0; t < ntiles; ++t) {
+        const int ii = (t / ntiles_j) * BS;
+        const int jj = (t % ntiles_j) * BS;
+        const int i_max = std::min(ii + BS, M);
+        const int j_max = std::min(jj + BS, N);
+        for (int kk = 0; kk < K; kk += BS) {
+            const int k_max = std::min(kk + BS, K);
+            for (int i = ii; i < i_max; ++i) {
+                for (int k = kk; k < k_max; ++k) {
+                    const float a = alpha * Ar[(size_t)i * K + k];
+                    // Row pointers hoisted out of the loop: MSVC's vectorizer
+                    // gives up on the mixed (size_t)i*N + j addressing, but
+                    // Crow[j] += a * Brow[j] over plain int j is the canonical
+                    // pattern every vectorizer handles.
+                    float*       __restrict Crow = Cr + (size_t)i * N;
+                    const float* __restrict Brow = Br + (size_t)k * N;
+                    #pragma omp simd
+                    for (int j = jj; j < j_max; ++j) {
+                        Crow[j] += a * Brow[j];
                     }
                 }
             }

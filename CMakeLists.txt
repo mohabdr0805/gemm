@@ -32,18 +32,18 @@ find_package(OpenMP)
 # --- CPU library -------------------------------------------------------------
 add_library(gemm_cpu src/gemm_cpu.cpp src/softmax_cpu.cpp src/attention_cpu.cpp)
 target_include_directories(gemm_cpu PUBLIC include)
-# MSVC's classic /openmp is stuck at OpenMP 2.0, which silently ignores the
-# collapse(2) in gemm_tiled (warning C4849) and parallelizes only the outer loop.
-# /openmp:llvm selects MSVC's OpenMP 3.1+ runtime so the (ii,jj) tiles are really
-# spread across threads. GCC/Clang keep the normally-detected OpenMP.
+# MSVC needs /openmp:experimental for the `omp simd` directive that gemm_tiled's
+# inner loop relies on to vectorize (MSVC refuses on its own, assuming C may
+# alias B). That mode is OpenMP 2.0 + simd: it does NOT support `collapse`, which
+# it silently ignores with warning C4849. /openmp:llvm is the reverse trade --
+# collapse works, `omp simd` is rejected (error C7660) -- so no single MSVC flag
+# gives both. gemm_tiled therefore fuses its two tile loops by hand and needs no
+# collapse clause, which makes the choice of flag a pure `omp simd` question.
+# GCC/Clang keep the normally-detected OpenMP (where both would work).
 if(MSVC)
   # PRIVATE: the OpenMP pragmas live only in the .cpp files (no public header
-  # uses OpenMP), and MSVC objects embed the libomp defaultlib directive, so
+  # uses OpenMP), and MSVC objects embed the vcomp defaultlib directive, so
   # consumers link fine without inheriting the flag.
-  # /openmp:experimental = the LLVM OpenMP runtime (so collapse(2) really
-  # parallelizes, like /openmp:llvm) PLUS the `omp simd` directive, which the
-  # tiled GEMM needs to vectorize its inner loop (MSVC refuses on its own,
-  # assuming C may alias B).
   target_compile_options(gemm_cpu PRIVATE /openmp:experimental)
 elseif(OpenMP_CXX_FOUND)
   # PUBLIC on purpose here: with GCC/Clang the consumers of the static lib do
