@@ -218,6 +218,20 @@ The v4 row is the same kernel forced back under the cliff with
 128 without being asked: its split addressing is
 cheaper than v3's, so the kernel sits on the cliff naturally.
 
+**The geometry is measured, not assumed.** The 128×128×8 block tile with an 8×8
+micro-block was chosen at v2 and never re-examined, so the kernel was
+parametrized on `<BM, BN, BK, TM, TN>` and twelve valid configurations were
+swept at n=4096, each validated against the CPU oracle before being timed. None
+beat the original: 128×64 reaches 80% of cuBLAS, 64×128 76%, and the 512-thread
+configurations that trade arithmetic intensity for occupancy land at 71%, the
+worst of the set. Larger tiles do have the better ratio on paper (256×128×8
+loads 3072 floats for 262144 FMAs, 85 per float against 64) and still lose,
+because the register budget bites before the intensity pays. 256×256 with a
+16×16 micro-block is the limit case: `acc` alone needs 256 registers against the
+255 available, and it runs 23× slower. The parametrized kernel is not shipped,
+since it found nothing faster than what is already here; the sweep is the
+result.
+
 ## GPU v3 — `gemm_reg_v3db_kernel` (float4 + double buffering)
 
 v2 sits at ~61% of cuBLAS. Nsight Compute on the v2 kernel at n=4096 (full grid)
