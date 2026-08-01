@@ -2,15 +2,16 @@
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
-> **TL;DR**: hand-written CUDA SGEMM that beats cuBLAS SGEMM on 12–13 of 25
-> tested sizes and sits at 92% of it at n=4096, through shared-memory tiling,
-> register tiling, vectorized double-buffered loads, conflict-free shared reads,
-> warp tiling (v6) and a second tile geometry chosen by a wave-quantization
-> rule, each step picked by a Nsight Compute profile, plus a
-> FlashAttention-style attention kernel that gains up to ~8.4× from query
-> tiling. Every kernel is validated against a CPU oracle. Device figures are
-> measured on an RTX 3080 with locked clocks, over ~200 ms of work per kernel,
-> with cuBLAS timed in the same run.
+> **TL;DR**: hand-written CUDA SGEMM at **99.8% of cuBLAS SGEMM** on the
+> geometric mean of 25 square aligned sizes from n=1024 to 4096, ahead of it on
+> 13 of them, spread 78% to 122%. The low end is wave quantization, modelled
+> below. Built through shared-memory tiling, register tiling, vectorized
+> double-buffered loads, conflict-free shared reads, warp tiling, and a second
+> tile geometry chosen by that same quantization model, each step picked from a
+> Nsight Compute profile. Plus a FlashAttention-style attention kernel that
+> gains up to ~8.4× from query tiling. Every kernel is validated against a CPU
+> oracle. Device figures are measured on an RTX 3080 with locked clocks, over
+> ~200 ms of work per kernel, with cuBLAS timed in the same run.
 
 Optimized GEMM (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, single precision,
 row-major. The repo goes from a naive reference to tuned CPU and GPU kernels and
@@ -37,7 +38,7 @@ basic building block of an inference layer.
   and shared budget, a third fewer shared-memory wavefronts; +4% everywhere,
   which takes the count of sizes beating cuBLAS from 5 to 12 out of 25. Ships in
   two tile geometries, 128×128 and 256×128, picked by a wave-quantization rule
-  that matched the faster one on 13 of 13 sizes without timing them.
+  that matched the faster one on every size where both apply, without timing them.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
   shared-memory tree reductions); the attention kernels build on it.
@@ -580,9 +581,24 @@ of the 13 sizes where both apply, without timing anything.
 | 4096 | 94%                | 94%                | 256×128 | +2.5%    |
 
 It needs `M % 256 == 0`, so 13 of the 25 swept sizes can use it and the rest fall
-back. It never loses a size, and it gains one: 12 of 25 sizes beat cuBLAS with
-the 128×128 tile alone, 13 with the dispatch. At n=4096 an alternated A/B over
-six rounds puts it between +1.4% and +5.2%, median +2.9%.
+back. It never loses a size, and it gains one. Over the sweep:
+
+|                     | geometric mean | median | range      | above cuBLAS |
+|---------------------|----------------|--------|------------|--------------|
+| 128×128 alone       | 99.1%          | 98.5%  | 78.1–122.0%| 12 of 25     |
+| **with the dispatch** | **99.8%**    | 100.6% | 78.1–122.0%| **13 of 25** |
+
+At n=4096 an alternated A/B over six rounds puts the gain between +1.4% and
++5.2%, median +2.9%.
+
+The geometric mean is the honest one to quote here: the arithmetic mean reads
+100.1%, which would license "beats cuBLAS on average", but that is the 122% at
+n=1024 doing the work, and averaging ratios arithmetically overweights the wins.
+99.8% is parity, slightly under. The spread matters more than either: a factor
+1.5 separates the ends, and the 78% is n=1152, which the model above accounts
+for. And the domain is square aligned shapes; outside `M % 128 == 0`,
+`N % 128 == 0`, `K % 8 == 0` the wrapper falls back to the register-tiled v2 at
+around 61% of cuBLAS.
 
 Two caveats on those counts. They move by one between runs, because a handful of
 sizes sit within a point of the line and the ratio at n=1920 has swung 95% to
