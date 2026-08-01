@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cfloat>
+#include <vector>  // the benchmark's rotated input buffers
 
 #define SOFTMAX_THREADS 256 // power of two: required by the tree reduction below
 
@@ -168,13 +169,23 @@ void benchmark_softmax(int M, int N) {
     if (M <= 0 || N <= 0) return;
     const size_t sz = (size_t)M * N * sizeof(float);
 
-    float *dIn, *dOut;
-    CUDA_CHECK(cudaMalloc(&dIn, sz));
+    // Rotated inputs, same rule as the other benchmarks. Softmax turned out not
+    // to need it -- measured 0.0 to 0.6% either way at 1024x1024, where the
+    // input is 4 MB against a 5 MB L2 -- because the kernel writes as much as it
+    // reads, so its own output evicts the input before the next iteration. It
+    // rotates anyway: the small sizes of the sweep are under that threshold, and
+    // one protocol for all three benchmarks is worth more than the saved memory.
+    const int k = bench::rotation_copies(sz);
+    std::vector<float*> dIns(k);
+    for (int i = 0; i < k; ++i) {
+        CUDA_CHECK(cudaMalloc(&dIns[i], sz));
+        CUDA_CHECK(cudaMemset(dIns[i], 0, sz));
+    }
+    float* dOut;
     CUDA_CHECK(cudaMalloc(&dOut, sz));
-    CUDA_CHECK(cudaMemset(dIn, 0, sz));
 
-    auto run3 = [&]{ softmax_rows_kernel       <<<M, SOFTMAX_THREADS>>>(M, N, dIn, dOut); };
-    auto runo = [&]{ softmax_rows_online_kernel<<<M, SOFTMAX_THREADS>>>(M, N, dIn, dOut); };
+    auto run3 = [&](int i){ softmax_rows_kernel       <<<M, SOFTMAX_THREADS>>>(M, N, dIns[i%k], dOut); };
+    auto runo = [&](int i){ softmax_rows_online_kernel<<<M, SOFTMAX_THREADS>>>(M, N, dIns[i%k], dOut); };
 
     int it3 = 0, ito = 0;
     const double t3 = bench::ms_per_iter(run3, &it3);
@@ -193,7 +204,8 @@ void benchmark_softmax(int M, int N) {
                 M, N, to, gb / (to / 1e3), ito);
     std::printf("  online speedup : %.2fx\n", t3 / to);
 
-    cudaFree(dIn); cudaFree(dOut);
+    for (int i = 0; i < k; ++i) cudaFree(dIns[i]);
+    cudaFree(dOut);
 }
 
 } // namespace gemm

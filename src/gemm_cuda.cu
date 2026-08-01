@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring> // std::memset, for the beta==0 quick return
+#include <vector>  // the benchmark's rotated input buffers
 
 #define TILE 16
 
@@ -233,13 +234,20 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
     const size_t sc = (size_t)M * N * sizeof(float);
     const size_t sbias = (size_t)N * sizeof(float);
 
-    float *dA, *dB, *dC, *dbias;
-    CUDA_CHECK(cudaMalloc(&dA, sa));
-    CUDA_CHECK(cudaMalloc(&dB, sb));
+    // Rotated inputs, same rule as the other benchmarks. This one samples shapes
+    // as small as 256x256x256, where A and B together are 768 KB against a 5 MB
+    // L2, so a fixed pair of buffers would be read entirely from cache.
+    const int k = bench::rotation_copies(sa + sb);
+    std::vector<float*> dAs(k), dBs(k);
+    for (int i = 0; i < k; ++i) {
+        CUDA_CHECK(cudaMalloc(&dAs[i], sa));
+        CUDA_CHECK(cudaMalloc(&dBs[i], sb));
+        CUDA_CHECK(cudaMemset(dAs[i], 0, sa));
+        CUDA_CHECK(cudaMemset(dBs[i], 0, sb));
+    }
+    float *dC, *dbias;
     CUDA_CHECK(cudaMalloc(&dC, sc));
     CUDA_CHECK(cudaMalloc(&dbias, sbias));
-    CUDA_CHECK(cudaMemset(dA, 0, sa));
-    CUDA_CHECK(cudaMemset(dB, 0, sb));
     CUDA_CHECK(cudaMemset(dbias, 0, sbias));
 
     dim3 block(TILE, TILE);
@@ -247,9 +255,9 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
     const int threads = 256;
     const int blocks = (M * N + threads - 1) / threads;
 
-    auto run_fused = [&]{ launch_fused(grid, block, M, N, K, alpha, dA, dB, beta, dC, dbias, act); };
-    auto run_two_pass = [&]{
-        gemm_kernel<<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+    auto run_fused = [&](int i){ launch_fused(grid, block, M, N, K, alpha, dAs[i%k], dBs[i%k], beta, dC, dbias, act); };
+    auto run_two_pass = [&](int i){
+        gemm_kernel<<<grid, block>>>(M, N, K, alpha, dAs[i%k], dBs[i%k], beta, dC);
         switch (act) {
             case Activation::ReLU: bias_act_kernel<Activation::ReLU><<<blocks, threads>>>(M, N, dC, dbias); break;
             case Activation::GELU: bias_act_kernel<Activation::GELU><<<blocks, threads>>>(M, N, dC, dbias); break;
@@ -266,7 +274,8 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
     std::printf("  two-pass : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n", tu, gflop / (tu / 1e3), itu);
     std::printf("  fusion speedup : %.2fx\n", tu / tf);
 
-    cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dbias);
+    for (int i = 0; i < k; ++i) { cudaFree(dAs[i]); cudaFree(dBs[i]); }
+    cudaFree(dC); cudaFree(dbias);
 }
 
 // v2: register tiling. 128x128 block tile, K in steps of BK=8, 256 threads, each
@@ -651,6 +660,124 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
     }
 }
 
+// v6: v5 + a warp tier between the block tile and the thread tile. v5 has no
+// warp level, so a warp (32 consecutive tids) spans threadRow over 2 values and
+// threadCol over 16: a 16x128 sliver of the block tile. Giving each warp a
+// 128x16 tile instead changes what a warp's 32 lanes read per k-step -- 16
+// distinct As rows and 2 distinct Bs column groups, against 2 and 16 before.
+// Same instruction count, but they coalesce into a third fewer wavefronts
+// (3.0 -> 2.0 per shared-load instruction, l1tex__data_pipe_lsu_wavefronts_mem_
+// shared_op_ld over smsp__inst_executed_op_shared_ld), where the ~4% comes from.
+//
+// Both tiles are read in groups of 4 (the float4 the hardware can serve in one
+// pass). Bs already was, since v5. As has to be too here: warp tiling makes its
+// read strided (16 rows 8 floats apart land on 4 banks, a 4-way conflict worth
+// 134M of them, measured) and the same split fixes it. That took the gain from
+// ~3% to ~5%. The elongated warp tile beating the square 64x32 one was not the
+// prediction; see the README.
+template <int MIN_BLOCKS>
+__global__ void __launch_bounds__(256, MIN_BLOCKS)
+gemm_reg_v6_kernel(int M, int N, int K, float alpha,
+                   const float* __restrict__ A, const float* __restrict__ B,
+                   float beta, float* __restrict__ C) {
+    constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
+    constexpr int WM = 128, WN = 16;        // warp tile: the 8 warps stack along N
+    constexpr int WCOLS  = BN / WN;         // warps across N
+    constexpr int WSUB_N = WN / TN;         // threads of a warp across N
+    constexpr int GW = 4;                   // group width: one float4
+    constexpr int GN = TN / GW, SPN = WN / GN;  // Bs: groups and their spacing
+    constexpr int GM = TM / GW, SPM = WM / GM;  // As: idem
+
+    __shared__ float As[2][BK * BM];        // transposed: As[buf][k*BM + m]
+    __shared__ float Bs[2][BK * BN];
+
+    const int blockRow = blockIdx.y * BM;
+    const int blockCol = blockIdx.x * BN;
+    const int tid  = threadIdx.x;
+    const int warp = tid / 32, lane = tid % 32;
+    const int warpRow = (warp / WCOLS) * WM;
+    const int warpCol = (warp % WCOLS) * WN;
+    const int rowBase = warpRow + (lane / WSUB_N) * GW;   // first row group
+    const int colBase = warpCol + (lane % WSUB_N) * GW;   // first column group
+    const int innerRowA = tid / (BK / 4), innerColA = tid % (BK / 4);
+    const int innerRowB = tid / (BN / 4), innerColB = tid % (BN / 4);
+
+    float acc[TM][TN] = {};
+    float regM[TM], regN[TN];
+
+    // Prologue: stage tile 0 into buffer 0 (unchanged from v5).
+    {
+        const float4 a4 = *reinterpret_cast<const float4*>(
+            &A[(size_t)(blockRow + innerRowA) * K + innerColA * 4]);
+        As[0][(innerColA*4+0)*BM + innerRowA] = a4.x;
+        As[0][(innerColA*4+1)*BM + innerRowA] = a4.y;
+        As[0][(innerColA*4+2)*BM + innerRowA] = a4.z;
+        As[0][(innerColA*4+3)*BM + innerRowA] = a4.w;
+        *reinterpret_cast<float4*>(&Bs[0][innerRowB*BN + innerColB*4]) =
+            *reinterpret_cast<const float4*>(
+                &B[(size_t)innerRowB * N + blockCol + innerColB*4]);
+    }
+    __syncthreads();
+
+    int buf = 0;
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        const bool has_next = (k0 + BK < K);
+        float4 a_next, b_next;
+        if (has_next) {
+            a_next = *reinterpret_cast<const float4*>(
+                &A[(size_t)(blockRow + innerRowA) * K + (k0 + BK) + innerColA * 4]);
+            b_next = *reinterpret_cast<const float4*>(
+                &B[(size_t)((k0 + BK) + innerRowB) * N + blockCol + innerColB * 4]);
+        }
+
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            #pragma unroll
+            for (int g = 0; g < GM; ++g)
+                #pragma unroll
+                for (int i = 0; i < GW; ++i)
+                    regM[g*GW + i] = As[buf][kk*BM + rowBase + g*SPM + i];
+            #pragma unroll
+            for (int g = 0; g < GN; ++g)
+                #pragma unroll
+                for (int j = 0; j < GW; ++j)
+                    regN[g*GW + j] = Bs[buf][kk*BN + colBase + g*SPN + j];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] += regM[i] * regN[j];
+        }
+
+        if (has_next) {
+            As[1-buf][(innerColA*4+0)*BM + innerRowA] = a_next.x;
+            As[1-buf][(innerColA*4+1)*BM + innerRowA] = a_next.y;
+            As[1-buf][(innerColA*4+2)*BM + innerRowA] = a_next.z;
+            As[1-buf][(innerColA*4+3)*BM + innerRowA] = a_next.w;
+            *reinterpret_cast<float4*>(&Bs[1-buf][innerRowB*BN + innerColB*4]) = b_next;
+            __syncthreads();
+            buf = 1 - buf;
+        }
+    }
+
+    // Epilogue: rows and columns both follow the group layout used above.
+    #pragma unroll
+    for (int t = 0; t < TM; ++t) {
+        const int gRow = blockRow + rowBase + (t / GW) * SPM + (t % GW);
+        #pragma unroll
+        for (int g = 0; g < GN; ++g) {
+            const size_t idx = (size_t)gRow * N + blockCol + colBase + g * SPN;
+            float4 out = { alpha * acc[t][g*GW+0], alpha * acc[t][g*GW+1],
+                           alpha * acc[t][g*GW+2], alpha * acc[t][g*GW+3] };
+            if (beta != 0.0f) {
+                const float4 c = *reinterpret_cast<float4*>(&C[idx]);
+                out.x += beta * c.x; out.y += beta * c.y;
+                out.z += beta * c.z; out.w += beta * c.w;
+            }
+            *reinterpret_cast<float4*>(&C[idx]) = out;
+        }
+    }
+}
+
 static bool v3_aligned(int M, int N, int K) { return M % 128 == 0 && N % 128 == 0 && K % 8 == 0; }
 
 void gemm_cuda_v3(int M, int N, int K, float alpha,
@@ -687,9 +814,9 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, dev));
     if ((int)(grid.x * grid.y) >= 2 * smCount)
-        gemm_reg_v5_kernel<2><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+        gemm_reg_v6_kernel<2><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
     else
-        gemm_reg_v5_kernel<1><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+        gemm_reg_v6_kernel<1><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -739,12 +866,33 @@ void benchmark_gemm_versions(int M, int N, int K) {
     const size_t sa = (size_t)M * K * sizeof(float);
     const size_t sb = (size_t)K * N * sizeof(float);
     const size_t sc = (size_t)M * N * sizeof(float);
-    float *dA, *dB, *dC;
-    CUDA_CHECK(cudaMalloc(&dA, sa));
-    CUDA_CHECK(cudaMalloc(&dB, sb));
+    // Buffer rotation, per NVIDIA's GEMM measurement guidelines: with a single
+    // pair of input buffers, iteration i+1 finds A and B still in L2 from
+    // iteration i and reads a cache the timing then credits to the kernel.
+    //
+    // k collapses to 1, and the rotation to a no-op, as soon as A and B alone
+    // exceed twice the L2 -- from n = 1145 on this card, so only the small sizes
+    // ever allocate anything extra. C is not rotated: it is overwritten every
+    // iteration, so nothing carries over that would flatter the next one.
+    //
+    // Measured effect here: none. At n = 1024, the size the guideline flags, an
+    // alternated in-place A/B puts the rotation at -0.2% for v6 and +0.3% for
+    // cuBLAS, under the run-to-run spread. A GEMM moves 12 MB per launch against
+    // a 5 MB L2, so it has already evicted its own inputs before the next
+    // iteration starts. The rotation stays because it is free and because the
+    // guideline is the guideline, not because it changed a number. It does move
+    // the attention benchmark, by ~10%.
+    const int k = bench::rotation_copies(sa + sb);
+
+    std::vector<float*> dAs((size_t)k), dBs((size_t)k);
+    for (int i = 0; i < k; ++i) {
+        CUDA_CHECK(cudaMalloc(&dAs[i], sa));
+        CUDA_CHECK(cudaMalloc(&dBs[i], sb));
+        CUDA_CHECK(cudaMemset(dAs[i], 0, sa));
+        CUDA_CHECK(cudaMemset(dBs[i], 0, sb));
+    }
+    float* dC;
     CUDA_CHECK(cudaMalloc(&dC, sc));
-    CUDA_CHECK(cudaMemset(dA, 0, sa));
-    CUDA_CHECK(cudaMemset(dB, 0, sb));
 
     dim3 b1(TILE, TILE), g1((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
     constexpr int BM = 128, BN = 128;
@@ -753,29 +901,35 @@ void benchmark_gemm_versions(int M, int N, int K) {
     CUBLAS_CHECK(cublasCreate(&h));
     dim3 g3v(N / BN, M / BM); // v3 fast path assumes aligned sizes
     const bool v3ok = v3_aligned(M, N, K);
-    auto run_v1 = [&]{ gemm_kernel<<<g1, b1>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    auto run_v2 = [&]{ gemm_reg_kernel<<<g2, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    auto run_v3 = [&]{ gemm_reg_v3_kernel<<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    auto run_cb = [&]{ CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
-                                                N, M, K, &alpha, dB, N, dA, K, &beta, dC, N)); };
+    // Every kernel rotates, cuBLAS included: measuring the baseline on a warm
+    // cache and ours on a cold one would be worse than the original problem.
+    auto A = [&](int i) { return dAs[i % k]; };
+    auto B = [&](int i) { return dBs[i % k]; };
+    auto run_v1 = [&](int i){ gemm_kernel<<<g1, b1>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    auto run_v2 = [&](int i){ gemm_reg_kernel<<<g2, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    auto run_v3 = [&](int i){ gemm_reg_v3_kernel<<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    auto run_cb = [&](int i){ CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
+                                                N, M, K, &alpha, B(i), N, A(i), K, &beta, dC, N)); };
 
     // Warm-up (the first cuBLAS call also pays its workspace init).
-    auto run_v3db = [&]{ gemm_reg_v3db_kernel<1><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    auto run_v4   = [&]{ gemm_reg_v3db_kernel<2><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    auto run_v5   = [&]{ gemm_reg_v5_kernel<1><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    auto run_v5lb = [&]{ gemm_reg_v5_kernel<2><<<g3v, b2>>>(M, N, K, alpha, dA, dB, beta, dC); };
-    run_v1(); run_v2(); if (v3ok) { run_v3(); run_v3db(); run_v4(); run_v5(); run_v5lb(); } run_cb(); CUDA_CHECK(cudaDeviceSynchronize());
+    auto run_v3db = [&](int i){ gemm_reg_v3db_kernel<1><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    auto run_v4   = [&](int i){ gemm_reg_v3db_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    auto run_v5   = [&](int i){ gemm_reg_v5_kernel<1><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    auto run_v5lb = [&](int i){ gemm_reg_v5_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    auto run_v6   = [&](int i){ gemm_reg_v6_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    run_v1(0); run_v2(0); if (v3ok) { run_v3(0); run_v3db(0); run_v4(0); run_v5(0); run_v5lb(0); run_v6(0); } run_cb(0); CUDA_CHECK(cudaDeviceSynchronize());
 
-    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, i6 = 0, i7 = 0, ib = 0;
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, i6 = 0, i7 = 0, i8 = 0, ib = 0;
     const double t1 = bench::ms_per_iter(run_v1, &i1);
     const double t2 = bench::ms_per_iter(run_v2, &i2);
-    double t3 = 0.0, t4 = 0.0, t5 = 0.0, t6 = 0.0, t7 = 0.0;
+    double t3 = 0.0, t4 = 0.0, t5 = 0.0, t6 = 0.0, t7 = 0.0, t8 = 0.0;
     if (v3ok) {
         t3 = bench::ms_per_iter(run_v3,   &i3);
         t4 = bench::ms_per_iter(run_v3db, &i4);
         t5 = bench::ms_per_iter(run_v4,   &i5);
         t6 = bench::ms_per_iter(run_v5,   &i6);
         t7 = bench::ms_per_iter(run_v5lb, &i7);
+        t8 = bench::ms_per_iter(run_v6,   &i8);
     }
     const double tb = bench::ms_per_iter(run_cb, &ib);
 
@@ -785,18 +939,20 @@ void benchmark_gemm_versions(int M, int N, int K) {
     std::printf("  v2 register      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t2, g2f, 100.0 * g2f / gbf, i2);
     if (v3ok) {
         const double g3f = gflop / (t3 / 1e3), g4f = gflop / (t4 / 1e3), g5f = gflop / (t5 / 1e3);
-        const double g6f = gflop / (t6 / 1e3), g7f = gflop / (t7 / 1e3);
+        const double g6f = gflop / (t6 / 1e3), g7f = gflop / (t7 / 1e3), g8f = gflop / (t8 / 1e3);
         std::printf("  v3 float4        : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t3, g3f, 100.0 * g3f / gbf, i3);
         std::printf("  v3 float4+2xbuf  : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t4, g4f, 100.0 * g4f / gbf, i4);
         std::printf("  v4 +launch_bounds: %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t5, g5f, 100.0 * g5f / gbf, i5);
         std::printf("  v5 Bs-split      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t6, g6f, 100.0 * g6f / gbf, i6);
         std::printf("  v5 Bs-split+lb   : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t7, g7f, 100.0 * g7f / gbf, i7);
+        std::printf("  v6 warp-tiled    : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t8, g8f, 100.0 * g8f / gbf, i8);
     }
     std::printf("  cuBLAS SGEMM     : %7.3f ms/iter  %8.2f GFLOP/s                       [%4d it]\n", tb, gbf, ib);
     std::printf("  register-tiling speedup v1->v2 : %.2fx\n", t1 / t2);
 
     CUBLAS_CHECK(cublasDestroy(h));
-    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    for (int i = 0; i < k; ++i) { cudaFree(dAs[i]); cudaFree(dBs[i]); }
+    cudaFree(dC);
 }
 
 } // namespace gemm

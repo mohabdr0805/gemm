@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cfloat>
 #include <cmath>
+#include <vector>  // the benchmark's rotated input buffers
 
 #define ATTN_THREADS 128 // threads per block (one block handles one query row)
 #define ATTN_BC      32  // key tile width (power of two: tree reductions below)
@@ -446,19 +447,28 @@ void benchmark_attention_versions(int M, int N, int d, bool causal) {
     const size_t sq  = (size_t)M * d * sizeof(float);
     const size_t skv = (size_t)N * d * sizeof(float);
 
-    float *dQ, *dK, *dV, *dO;
-    CUDA_CHECK(cudaMalloc(&dQ, sq));
-    CUDA_CHECK(cudaMalloc(&dK, skv));
-    CUDA_CHECK(cudaMalloc(&dV, skv));
+    // Rotated inputs. Attention is the benchmark this matters for: at n=4096,
+    // d=64, Q+K+V is 3 MB against a 5 MB L2, so without rotation every iteration
+    // reads a fully cached working set. Measured cost of the rotation here:
+    // ~10%, at both n=1024 and n=4096, 6 alternated rounds out of 6. GEMM by
+    // contrast moves by ~0 (see the README methodology note).
+    const int k = bench::rotation_copies(sq + 2 * skv);
+    std::vector<float*> dQs(k), dKs(k), dVs(k);
+    for (int i = 0; i < k; ++i) {
+        CUDA_CHECK(cudaMalloc(&dQs[i], sq));
+        CUDA_CHECK(cudaMalloc(&dKs[i], skv));
+        CUDA_CHECK(cudaMalloc(&dVs[i], skv));
+        CUDA_CHECK(cudaMemset(dQs[i], 0, sq));
+        CUDA_CHECK(cudaMemset(dKs[i], 0, skv));
+        CUDA_CHECK(cudaMemset(dVs[i], 0, skv));
+    }
+    float* dO; // not rotated: rewritten every iteration anyway
     CUDA_CHECK(cudaMalloc(&dO, sq));
-    CUDA_CHECK(cudaMemset(dQ, 0, sq));
-    CUDA_CHECK(cudaMemset(dK, 0, skv));
-    CUDA_CHECK(cudaMemset(dV, 0, skv));
 
     const float scale = 1.0f / std::sqrt((float)d);
     dim3 b2(ATTN2_BR), g2((M + ATTN2_BR - 1) / ATTN2_BR);
-    auto run_v1 = [&]{ flash_attention_kernel<<<M, ATTN_THREADS>>>(M, N, d, scale, dQ, dK, dV, dO, causal); };
-    auto run_v2 = [&]{ launch_v2(g2, b2, M, N, d, scale, dQ, dK, dV, dO, causal); };
+    auto run_v1 = [&](int i){ flash_attention_kernel<<<M, ATTN_THREADS>>>(M, N, d, scale, dQs[i%k], dKs[i%k], dVs[i%k], dO, causal); };
+    auto run_v2 = [&](int i){ launch_v2(g2, b2, M, N, d, scale, dQs[i%k], dKs[i%k], dVs[i%k], dO, causal); };
 
     int it1 = 0, it2 = 0;
     const double t1 = bench::ms_per_iter(run_v1, &it1);
@@ -472,7 +482,8 @@ void benchmark_attention_versions(int M, int N, int d, bool causal) {
                 causal ? "causal" : "full  ", t2, gflop / (t2 / 1e3), it2);
     std::printf("  query-tiling speedup : %.2fx\n", t1 / t2);
 
-    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+    for (int i = 0; i < k; ++i) { cudaFree(dQs[i]); cudaFree(dKs[i]); cudaFree(dVs[i]); }
+    cudaFree(dO);
 }
 
 // v2 (one thread per row) vs FA-2 (one warp per row, head dim split across lanes),
@@ -483,20 +494,24 @@ void benchmark_attention_fa2(int M, int N, int d, bool causal) {
     const size_t sq  = (size_t)M * d * sizeof(float);
     const size_t skv = (size_t)N * d * sizeof(float);
 
-    float *dQ, *dK, *dV, *dO;
-    CUDA_CHECK(cudaMalloc(&dQ, sq));
-    CUDA_CHECK(cudaMalloc(&dK, skv));
-    CUDA_CHECK(cudaMalloc(&dV, skv));
+    const int k = bench::rotation_copies(sq + 2 * skv); // same reason as above
+    std::vector<float*> dQs(k), dKs(k), dVs(k);
+    for (int i = 0; i < k; ++i) {
+        CUDA_CHECK(cudaMalloc(&dQs[i], sq));
+        CUDA_CHECK(cudaMalloc(&dKs[i], skv));
+        CUDA_CHECK(cudaMalloc(&dVs[i], skv));
+        CUDA_CHECK(cudaMemset(dQs[i], 0, sq));
+        CUDA_CHECK(cudaMemset(dKs[i], 0, skv));
+        CUDA_CHECK(cudaMemset(dVs[i], 0, skv));
+    }
+    float* dO;
     CUDA_CHECK(cudaMalloc(&dO, sq));
-    CUDA_CHECK(cudaMemset(dQ, 0, sq));
-    CUDA_CHECK(cudaMemset(dK, 0, skv));
-    CUDA_CHECK(cudaMemset(dV, 0, skv));
 
     const float scale = 1.0f / std::sqrt((float)d);
     dim3 b2(ATTN2_BR), g2((M + ATTN2_BR - 1) / ATTN2_BR);
     dim3 bf(32 * ATTN_FA2_WPB), gf((M + ATTN_FA2_WPB - 1) / ATTN_FA2_WPB);
-    auto run_v2  = [&]{ launch_v2 (g2, b2, M, N, d, scale, dQ, dK, dV, dO, causal); };
-    auto run_fa2 = [&]{ launch_fa2(gf, bf, M, N, d, scale, dQ, dK, dV, dO, causal); };
+    auto run_v2  = [&](int i){ launch_v2 (g2, b2, M, N, d, scale, dQs[i%k], dKs[i%k], dVs[i%k], dO, causal); };
+    auto run_fa2 = [&](int i){ launch_fa2(gf, bf, M, N, d, scale, dQs[i%k], dKs[i%k], dVs[i%k], dO, causal); };
 
     int it2 = 0, itf = 0;
     const double t2 = bench::ms_per_iter(run_v2,  &it2);
@@ -510,7 +525,8 @@ void benchmark_attention_fa2(int M, int N, int d, bool causal) {
                 causal ? "causal" : "full  ", tf, gflop / (tf / 1e3), itf);
     std::printf("  fa2 vs v2 speedup : %.2fx\n", t2 / tf);
 
-    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+    for (int i = 0; i < k; ++i) { cudaFree(dQs[i]); cudaFree(dKs[i]); cudaFree(dVs[i]); }
+    cudaFree(dO);
 }
 
 } // namespace gemm

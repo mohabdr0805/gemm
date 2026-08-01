@@ -47,6 +47,28 @@ int main() {
     std::printf("Max abs error (tiled vs naive) : %.3e (tol %.1e)\n", err_tiled, tol);
     if (err_tiled > tol) { std::printf("FAIL (tiled)\n"); rc = 1; }
 
+    // The tile loops are fused into one flat `t` loop, indexed back to (ii,jj)
+    // by hand, because MSVC ignores collapse(2). The default shape here is
+    // 125x93, which is 2x2 tiles: enough to run the mapping, not enough to catch
+    // a wrong one. These shapes exercise it lopsided in both directions, with a
+    // partial remainder tile on each axis.
+    {
+        const int shapes[][3] = { {700, 33, 40}, {33, 700, 40}, {200, 200, 8} };
+        for (const auto& s : shapes) {
+            const int m = s[0], n = s[1], k = s[2];
+            std::vector<float> a(m * k), b(k * n), co(m * n, 0.0f), ct(m * n, 0.0f);
+            for (auto& v : a) v = dist(rng);
+            for (auto& v : b) v = dist(rng);
+            gemm::gemm_naive(m, n, k, alpha, a.data(), b.data(), 0.0f, co.data());
+            gemm::gemm_tiled(m, n, k, alpha, a.data(), b.data(), 0.0f, ct.data());
+            double e = 0.0;
+            for (int i = 0; i < m * n; ++i) e = std::max(e, (double)std::fabs(co[i] - ct[i]));
+            std::printf("tiled %dx%dx%d (%d tiles) vs naive : %.3e\n",
+                        m, n, k, ((m + 63) / 64) * ((n + 63) / 64), e);
+            if (e > tol) { std::printf("FAIL (tiled shape)\n"); rc = 1; }
+        }
+    }
+
     // BLAS beta==0 semantics (CPU): C is write-only, so NaN-filled C must not
     // leak into the result -- 0*NaN would be NaN, the implementations must skip
     // the read instead of multiplying by zero.

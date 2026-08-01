@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
 
     // GEMM kernels vs the vendor baseline, device timing. The "% of cuBLAS"
     // ratios come from the same run, so they hold even when clocks swing.
-    std::printf("\n[GEMM v1..v5 vs cuBLAS]  device timing (no transfers)\n");
+    std::printf("\n[GEMM v1..v6 vs cuBLAS]  device timing (no transfers)\n");
     gemm::benchmark_gemm_versions(n, n, n);
 
     // Fused inference epilogue: fusion vs two-pass (pure device timing, no transfers).

@@ -59,6 +59,12 @@ if(USE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES "75;86")
   endif()
   enable_language(CUDA)
+  # Explicit rather than inherited from CMAKE_CXX_STANDARD: bench_timing.cuh
+  # needs C++17 (`if constexpr` + `std::is_invocable_v`, for the call sites that
+  # rotate their input buffers), and inheriting it silently would leave that
+  # dependency to a CMake default that is free to change.
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   find_package(CUDAToolkit REQUIRED) # for CUDA::cublas (the benchmark baseline)
   add_library(gemm_cuda src/gemm_cuda.cu src/softmax_cuda.cu src/attention_cuda.cu)
   target_include_directories(gemm_cuda PUBLIC include)
