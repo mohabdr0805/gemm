@@ -2,10 +2,11 @@
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
-> **TL;DR**: hand-written CUDA SGEMM that beats cuBLAS SGEMM on 12 of 25 tested
-> sizes and sits at 92% of it at n=4096, through shared-memory tiling, register
-> tiling, vectorized double-buffered loads, conflict-free shared reads and warp
-> tiling (v6), each step picked by a Nsight Compute profile, plus a
+> **TL;DR**: hand-written CUDA SGEMM that beats cuBLAS SGEMM on 12–13 of 25
+> tested sizes and sits at 92% of it at n=4096, through shared-memory tiling,
+> register tiling, vectorized double-buffered loads, conflict-free shared reads,
+> warp tiling (v6) and a second tile geometry chosen by a wave-quantization
+> rule, each step picked by a Nsight Compute profile, plus a
 > FlashAttention-style attention kernel that gains up to ~8.4× from query
 > tiling. Every kernel is validated against a CPU oracle. Device figures are
 > measured on an RTX 3080 with locked clocks, over ~200 ms of work per kernel,
@@ -34,7 +35,9 @@ basic building block of an inference layer.
   points everywhere. 90–98% of cuBLAS at n ≥ 2048, ~116% at n=1024.
 - GPU v6: a warp tier between the block tile and the thread tile. Same register
   and shared budget, a third fewer shared-memory wavefronts; +4% everywhere,
-  which takes the count of sizes beating cuBLAS from 5 to 12 out of 25.
+  which takes the count of sizes beating cuBLAS from 5 to 12 out of 25. Ships in
+  two tile geometries, 128×128 and 256×128, picked by a wave-quantization rule
+  that matched the faster one on 13 of 13 sizes without timing them.
 - Inference: fused GEMM + bias + activation (ReLU/GELU) in a single kernel.
 - Softmax: numerically stable row-wise softmax (CPU oracle + CUDA kernel with
   shared-memory tree reductions); the attention kernels build on it.
@@ -525,6 +528,95 @@ figure by the efficiency predicted 76% → 127% and 22 of 25 sizes. That ceiling
 assumes quantization can be removed at unchanged occupancy, and neither approach
 does both. Measured: +22.5% at the one size, and the same 12 of 25.
 
+### A second tile, chosen by the same model
+
+The model earns its keep somewhere else. Profiling cuBLAS names its kernel,
+`cutlass_80_simt_sgemm_256x128_8x4_nn_align1`, and the name is the whole
+configuration: a 256×128 block tile, 16×8 outputs per thread, 202 registers, one
+block per SM. That is the opposite of v4's choice, which spent
+`__launch_bounds__(256, 2)` to keep two blocks resident.
+
+The reason it wins is arithmetic intensity, at two levels at once. Per k-step a
+16×8 thread reads 16 A values and 8 of B, six 128-bit shared loads, and does 128
+FMAs: 21.3 FMAs per shared load against 8×8's 16. Measured shared-load
+instructions at n=4096 drop from 134 217 728 to 100 663 296, a quarter fewer,
+which is 134/101 = 1.33 against the predicted 21.33/16 = 1.33.
+
+The same doubling of the M tile halves the global traffic, because A's panel is
+read once for twice as many output rows. Measured at n=4096:
+
+| n=4096          | DRAM traffic | % of DRAM peak | L2 sectors    |
+|-----------------|--------------|----------------|---------------|
+| 128×128         | 1.47 GB      | 31.8%          | 136 703 329   |
+| **256×128**     | **732 MB**   | **15.8%**      | **103 272 762** |
+| cuBLAS          | 534 MB       | 12.4%          | 103 280 500   |
+
+Half the DRAM traffic, and the same L2 traffic as cuBLAS to within 8 000 sectors
+out of 103 million. Note what this rules out as well: at 16 to 32% of DRAM peak
+neither kernel is bandwidth-bound, so the gap to cuBLAS is not a memory-traffic
+problem. The L2 absorbs two thirds of the panel re-reads, 4.4 GB of L2 traffic
+against 1.47 GB reaching DRAM.
+
+That geometry had already been swept, and lost at 86% of cuBLAS. The sweep ran it
+on the v5 body, with no warp tier. On the warp-tiled body it reaches 94%: the
+warp tier is worth 7.6 points here against 4.9% on 128×128. A negative autotune
+result holds for the body it was measured on, not for the geometry.
+
+Both tiles ship, and the dispatch is the quantization model again. The 256×128
+grid is half the size, so it lands differently on the SM count: it wins whenever
+it quantizes at least as well, since at equal efficiency the intensity is free,
+and loses when its grid rounds up worse. That rule picked the faster kernel on 13
+of the 13 sizes where both apply, without timing anything.
+
+| n    | efficiency 128×128 | efficiency 256×128 | picked  | measured |
+|------|--------------------|--------------------|---------|----------|
+| 1024 | 94%                | 47%                | 128×128 | −45% if forced |
+| 1536 | 71%                | 53%                | 128×128 | −24% if forced |
+| 2048 | 94%                | 94%                | 256×128 | +1.6%    |
+| 2560 | 98%                | 98%                | 256×128 | +0.4%    |
+| 3328 | 99%                | 99%                | 256×128 | +4.0%    |
+| 3584 | 96%                | 96%                | 256×128 | +4.2%    |
+| 3840 | 95%                | 95%                | 256×128 | +2.9%    |
+| 4096 | 94%                | 94%                | 256×128 | +2.5%    |
+
+It needs `M % 256 == 0`, so 13 of the 25 swept sizes can use it and the rest fall
+back. It never loses a size, and it gains one: 12 of 25 sizes beat cuBLAS with
+the 128×128 tile alone, 13 with the dispatch. At n=4096 an alternated A/B over
+six rounds puts it between +1.4% and +5.2%, median +2.9%.
+
+Two caveats on those counts. They move by one between runs, because a handful of
+sizes sit within a point of the line and the ratio at n=1920 has swung 95% to
+113% across sessions. And the absolute GFLOP/s in the tables above predate this
+work: the machine measured ~18% low across every kernel including cuBLAS while
+this was being tuned, with the core provably healthy (a pure-FMA kernel with no
+memory access reached 97% of the card's FP32 peak in the same state). Ratios
+survive that, since cuBLAS is timed in the same run and moves with it; absolutes
+do not, so they were left alone rather than refreshed from a degraded reading.
+
+What it does not do is close the gap at n=4096, and the counters say why. With
+the bigger tile the instruction count is no longer the problem: 2.331 G
+instructions against cuBLAS's 2.399 G, the same shared-load count, zero bank
+conflicts, and a lower barrier stall (3.1% against 4.5%). The issue rate is what
+differs, 79.6% against 87.8%, and it is all in `short_scoreboard` plus `wait`:
+10.3% here against 4.5% there. Both run one block per SM, so it is not occupancy.
+
+Three attempts on that, all refuted. Double-buffering the shared loads in
+registers across the k-step changed nothing and left the register count at 206,
+which is the proof that ptxas already scheduled it that way. `cp.async` on the B
+tile cost 6.5%: it removes a fifth of the shared-store wavefronts, and triples
+`mio_throttle` from 1.5% to 4.7%, because the copy holds a queue slot for the
+whole compute phase. Deepening the pipeline to three and four stages made that
+worse, not better.
+
+The reason is visible in cuBLAS's counters. It issues 25 313 280 `cp.async`
+instructions and 8 192 ordinary global loads; this kernel issues none and 8.4 M.
+It stages *both* operands asynchronously. Doing that here means the A tile can no
+longer be transposed on the way into shared memory, and the transpose is what
+makes its read a vectorized one: with 32 lanes four rows apart, a flat layout
+puts every lane on the same bank, and no padding fixes it while keeping 16-byte
+alignment. So the last 6% is a different shared-memory addressing scheme, not a
+missing instruction.
+
 A linear layer computes `Y = act(X·W + bias)`. Naively that is two kernels: the
 GEMM, then an element-wise pass for bias and activation, which writes the output
 and reads it all back. The fused kernel does the bias and activation in the GEMM
@@ -817,10 +909,15 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
       `cp.async` is the usual answer and does not apply directly. The As tile is
       stored transposed, which needs the register round-trip that `cp.async`
       exists to remove. Warp specialization or a split arrive/wait barrier first
+- [x] Second tile geometry (256×128, 16×8 per thread, one block/SM), dispatched
+      on wave-quantization efficiency: +3% at n=4096, one more size over cuBLAS
 - [~] Stream-K: built and validated, not shipped. Recovers the quantization
       (n=1152 goes 76% → 93% of cuBLAS) but costs 19 registers, so the large
       sizes lose ~43%. Full measurement above, under "Where the remaining
       variation comes from"
+- [~] `cp.async`: refuted on this addressing scheme. It only pays if it stages
+      both operands, and the A tile's transpose blocks that (see the same
+      section). Measured −6.5%, and worse with a deeper pipeline
 - [ ] Fused epilogue on the register-tiled v2 GEMM
 - [x] Attention FA-2: warp-partitioned head dim (kills the d=128 spill; 1.7–6× over v2 at d=128)
 - [ ] Multi-device StarPU variant

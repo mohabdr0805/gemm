@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring> // std::memset, for the beta==0 quick return
+#include <cmath>   // std::ceil, for the wave-quantization dispatch
 #include <vector>  // the benchmark's rotated input buffers
 
 #define TILE 16
@@ -675,18 +676,31 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
 // 134M of them, measured) and the same split fixes it. That took the gain from
 // ~3% to ~5%. The elongated warp tile beating the square 64x32 one was not the
 // prediction; see the README.
-template <int MIN_BLOCKS>
-__global__ void __launch_bounds__(256, MIN_BLOCKS)
+// The geometry is a template parameter because two of them ship. The 128x128
+// tile below is v6 as first written; a 256x128 tile with a 16x8 thread block
+// joins it, and the dispatch in gemm_cuda_v3 picks between them. Everything
+// else in the body is shared, so the two differ only in these numbers.
+template <int BM, int BN, int WM, int WN, int TM, int TN, int MIN_BLOCKS>
+__global__ void __launch_bounds__((BM*BN)/(TM*TN), MIN_BLOCKS)
 gemm_reg_v6_kernel(int M, int N, int K, float alpha,
                    const float* __restrict__ A, const float* __restrict__ B,
                    float beta, float* __restrict__ C) {
-    constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
-    constexpr int WM = 128, WN = 16;        // warp tile: the 8 warps stack along N
+    constexpr int BK = 8;
+    constexpr int NT     = (BM * BN) / (TM * TN);   // threads per block
     constexpr int WCOLS  = BN / WN;         // warps across N
     constexpr int WSUB_N = WN / TN;         // threads of a warp across N
     constexpr int GW = 4;                   // group width: one float4
     constexpr int GN = TN / GW, SPN = WN / GN;  // Bs: groups and their spacing
     constexpr int GM = TM / GW, SPM = WM / GM;  // As: idem
+    // Each thread stages A4 float4 of A and B4 of B. Both are 1 for 128x128,
+    // and A4 is 2 for 256x128: twice the rows, same thread count.
+    constexpr int A4 = (BM * BK / 4) / NT, AR = NT / (BK / 4);
+    constexpr int B4 = (BK * BN / 4) / NT, BR = NT / (BN / 4);
+
+    static_assert((BM/WM) * WCOLS == NT / 32, "warp tiling does not pave the block");
+    static_assert((WM/TM) * WSUB_N == 32, "a warp must be exactly 32 threads");
+    static_assert(TM % 4 == 0 && TN % 4 == 0, "TM and TN must be float4 multiples");
+    static_assert((BM*BK) % (4*NT) == 0 && (BK*BN) % (4*NT) == 0, "staging does not divide");
 
     __shared__ float As[2][BK * BM];        // transposed: As[buf][k*BM + m]
     __shared__ float Bs[2][BK * BN];
@@ -706,28 +720,38 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
     float regM[TM], regN[TN];
 
     // Prologue: stage tile 0 into buffer 0 (unchanged from v5).
-    {
+    #pragma unroll
+    for (int p = 0; p < A4; ++p) {
+        const int rA = innerRowA + p * AR;
         const float4 a4 = *reinterpret_cast<const float4*>(
-            &A[(size_t)(blockRow + innerRowA) * K + innerColA * 4]);
-        As[0][(innerColA*4+0)*BM + innerRowA] = a4.x;
-        As[0][(innerColA*4+1)*BM + innerRowA] = a4.y;
-        As[0][(innerColA*4+2)*BM + innerRowA] = a4.z;
-        As[0][(innerColA*4+3)*BM + innerRowA] = a4.w;
-        *reinterpret_cast<float4*>(&Bs[0][innerRowB*BN + innerColB*4]) =
+            &A[(size_t)(blockRow + rA) * K + innerColA * 4]);
+        As[0][(innerColA*4+0)*BM + rA] = a4.x;
+        As[0][(innerColA*4+1)*BM + rA] = a4.y;
+        As[0][(innerColA*4+2)*BM + rA] = a4.z;
+        As[0][(innerColA*4+3)*BM + rA] = a4.w;
+    }
+    #pragma unroll
+    for (int p = 0; p < B4; ++p) {
+        const int rB = innerRowB + p * BR;
+        *reinterpret_cast<float4*>(&Bs[0][rB*BN + innerColB*4]) =
             *reinterpret_cast<const float4*>(
-                &B[(size_t)innerRowB * N + blockCol + innerColB*4]);
+                &B[(size_t)rB * N + blockCol + innerColB*4]);
     }
     __syncthreads();
 
     int buf = 0;
     for (int k0 = 0; k0 < K; k0 += BK) {
         const bool has_next = (k0 + BK < K);
-        float4 a_next, b_next;
+        float4 a_next[A4], b_next[B4];
         if (has_next) {
-            a_next = *reinterpret_cast<const float4*>(
-                &A[(size_t)(blockRow + innerRowA) * K + (k0 + BK) + innerColA * 4]);
-            b_next = *reinterpret_cast<const float4*>(
-                &B[(size_t)((k0 + BK) + innerRowB) * N + blockCol + innerColB * 4]);
+            #pragma unroll
+            for (int p = 0; p < A4; ++p)
+                a_next[p] = *reinterpret_cast<const float4*>(
+                    &A[(size_t)(blockRow + innerRowA + p*AR) * K + (k0 + BK) + innerColA * 4]);
+            #pragma unroll
+            for (int p = 0; p < B4; ++p)
+                b_next[p] = *reinterpret_cast<const float4*>(
+                    &B[(size_t)((k0 + BK) + innerRowB + p*BR) * N + blockCol + innerColB * 4]);
         }
 
         #pragma unroll
@@ -749,11 +773,18 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
         }
 
         if (has_next) {
-            As[1-buf][(innerColA*4+0)*BM + innerRowA] = a_next.x;
-            As[1-buf][(innerColA*4+1)*BM + innerRowA] = a_next.y;
-            As[1-buf][(innerColA*4+2)*BM + innerRowA] = a_next.z;
-            As[1-buf][(innerColA*4+3)*BM + innerRowA] = a_next.w;
-            *reinterpret_cast<float4*>(&Bs[1-buf][innerRowB*BN + innerColB*4]) = b_next;
+            #pragma unroll
+            for (int p = 0; p < A4; ++p) {
+                const int rA = innerRowA + p * AR;
+                As[1-buf][(innerColA*4+0)*BM + rA] = a_next[p].x;
+                As[1-buf][(innerColA*4+1)*BM + rA] = a_next[p].y;
+                As[1-buf][(innerColA*4+2)*BM + rA] = a_next[p].z;
+                As[1-buf][(innerColA*4+3)*BM + rA] = a_next[p].w;
+            }
+            #pragma unroll
+            for (int p = 0; p < B4; ++p)
+                *reinterpret_cast<float4*>(
+                    &Bs[1-buf][(innerRowB + p*BR)*BN + innerColB*4]) = b_next[p];
             __syncthreads();
             buf = 1 - buf;
         }
@@ -778,7 +809,39 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
     }
 }
 
+// The two shipped geometries. v6 is the original 128x128; v6_big trades half
+// the occupancy for twice the outputs per thread, which is cuBLAS's own choice
+// on this card (its kernel is cutlass_80_simt_sgemm_256x128_8x4). Per k-step a
+// thread there reads 16 A values and 8 of B for 128 FMAs, 21.3 FMAs per shared
+// load against 8x8's 16, so a quarter fewer shared-load instructions for the
+// same work. It costs 206 registers, hence one block per SM instead of two.
+#define GEMM_V6_SMALL 128, 128, 128, 16,  8, 8
+#define GEMM_V6_BIG   256, 128, 256, 16, 16, 8
+
 static bool v3_aligned(int M, int N, int K) { return M % 128 == 0 && N % 128 == 0 && K % 8 == 0; }
+
+// Wave quantization efficiency. The SM is the quantum, not the 2-blocks/SM
+// wave: the card runs `sm` blocks at a time, so the makespan is ceil(blocks/sm)
+// block-times while the work is blocks/sm. A grid that overruns by one block
+// pays a whole extra pass. Checked against measurement on 14 sizes: one
+// parameter, 13 of them inside 3% (the README has the table).
+static double wave_efficiency(int blocks, int sm) {
+    const double w = (double)blocks / sm;
+    return w / std::ceil(w);
+}
+
+// Which of the two geometries to launch. The 256x128 tile has the better
+// arithmetic intensity, so it wins whenever it quantizes at least as well; when
+// it quantizes worse -- its grid is half the size, so it lands differently on
+// the SM count -- the lost wave costs more than the intensity gains. That rule
+// picked the faster kernel on 13 of 13 sizes where both apply, without timing
+// anything. It needs M % 256 == 0, so half the sizes fall back to 128x128.
+static bool pick_big_tile(int M, int N, int sm) {
+    if (M % 256 != 0) return false;
+    const int small = (M / 128) * (N / 128);
+    const int big   = (M / 256) * (N / 128);
+    return wave_efficiency(big, sm) >= wave_efficiency(small, sm);
+}
 
 void gemm_cuda_v3(int M, int N, int K, float alpha,
                   const float* A, const float* B, float beta, float* C) {
@@ -800,23 +863,27 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
     if (beta != 0.0f)
         CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
 
-    constexpr int BM = 128, BN = 128;
-    dim3 block(256);
-    dim3 grid(N / BN, M / BM);
-    // Pick the launch_bounds build from the grid, because neither wins
-    // everywhere. For v5 both builds cost 128 registers (the split addressing
-    // is cheaper than v3db's, so the kernel sits on the 2-blocks/SM cliff
-    // naturally), yet the hint still changes ptxas scheduling enough to
-    // measure: <1> is ~3.5 points of cuBLAS ahead at n=1024 (12/12 reps),
-    // <2> ~1 point ahead once the grid can seat 2 blocks/SM (11/12 reps).
-    // Same crossover as v4: 2 blocks/SM worth of grid.
     int dev = 0, smCount = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, dev));
-    if ((int)(grid.x * grid.y) >= 2 * smCount)
-        gemm_reg_v6_kernel<2><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
-    else
-        gemm_reg_v6_kernel<1><<<grid, block>>>(M, N, K, alpha, dA, dB, beta, dC);
+
+    if (pick_big_tile(M, N, smCount)) {
+        gemm_reg_v6_kernel<GEMM_V6_BIG, 1><<<dim3(N / 128, M / 256), 256>>>(
+            M, N, K, alpha, dA, dB, beta, dC);
+    } else {
+        // Pick the launch_bounds build from the grid, because neither wins
+        // everywhere. Both builds cost 128 registers here (the split addressing
+        // is cheaper than v3db's, so the kernel sits on the 2-blocks/SM cliff
+        // naturally), yet the hint still changes ptxas scheduling enough to
+        // measure: <1> is ~3.5 points of cuBLAS ahead at n=1024 (12/12 reps),
+        // <2> ~1 point ahead once the grid can seat 2 blocks/SM (11/12 reps).
+        // Same crossover as v4: 2 blocks/SM worth of grid.
+        const dim3 grid(N / 128, M / 128);
+        if ((int)(grid.x * grid.y) >= 2 * smCount)
+            gemm_reg_v6_kernel<GEMM_V6_SMALL, 2><<<grid, 256>>>(M, N, K, alpha, dA, dB, beta, dC);
+        else
+            gemm_reg_v6_kernel<GEMM_V6_SMALL, 1><<<grid, 256>>>(M, N, K, alpha, dA, dB, beta, dC);
+    }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -916,7 +983,18 @@ void benchmark_gemm_versions(int M, int N, int K) {
     auto run_v4   = [&](int i){ gemm_reg_v3db_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
     auto run_v5   = [&](int i){ gemm_reg_v5_kernel<1><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
     auto run_v5lb = [&](int i){ gemm_reg_v5_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
-    auto run_v6   = [&](int i){ gemm_reg_v6_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
+    // v6 goes through the same dispatch as gemm_cuda_v3, otherwise the benchmark
+    // reports a kernel the API does not launch. `big` is fixed per shape, so the
+    // branch costs nothing inside the timed loop.
+    int smCount = 0, bdev = 0;
+    CUDA_CHECK(cudaGetDevice(&bdev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, bdev));
+    const bool big = v3ok && pick_big_tile(M, N, smCount);
+    const dim3 gbig(N / 128, big ? M / 256 : 1);
+    auto run_v6   = [&](int i){
+        if (big) gemm_reg_v6_kernel<GEMM_V6_BIG,   1><<<gbig, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC);
+        else     gemm_reg_v6_kernel<GEMM_V6_SMALL, 2><<<g3v,  b2>>>(M, N, K, alpha, A(i), B(i), beta, dC);
+    };
     run_v1(0); run_v2(0); if (v3ok) { run_v3(0); run_v3db(0); run_v4(0); run_v5(0); run_v5lb(0); run_v6(0); } run_cb(0); CUDA_CHECK(cudaDeviceSynchronize());
 
     int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, i6 = 0, i7 = 0, i8 = 0, ib = 0;

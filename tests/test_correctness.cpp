@@ -152,6 +152,15 @@ int main() {
     // threshold, so this is the only shape here that exercises the
     // __launch_bounds__(256,2) build. K=24 keeps the naive oracle cheap.
     check_v3_aligned(1536, 1536, 24);
+    // The wrapper also picks between two tile geometries, 128x128 and 256x128,
+    // on wave-quantization efficiency. Which one a shape lands on depends on the
+    // SM count, so these two are chosen for the 68 SMs of the reference card:
+    // 256x8704 gives 136 blocks at 128x128 and 68 at 256x128, both a whole
+    // number of waves, so the tie goes to the bigger tile. 384x256 cannot use it
+    // at all (384 % 256 != 0) and pins the fallback. On another card the split
+    // moves, but whichever kernel runs is still checked against the oracle.
+    check_v3_aligned(256, 8704, 32); // -> 256x128 tile here
+    check_v3_aligned(384,  256, 64); // -> 128x128 tile, M not a 256 multiple
 
     // cuBLAS baseline vs naive: validates the row-major <-> column-major swap
     // (C^T = B^T A^T) before the benchmark quotes any "% of cuBLAS" number.
