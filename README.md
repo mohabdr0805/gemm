@@ -5,13 +5,10 @@
 > **TL;DR**: hand-written CUDA SGEMM at **99.8% of cuBLAS SGEMM** on the
 > geometric mean of 25 square aligned sizes from n=1024 to 4096, ahead of it on
 > 13 of them, spread 78% to 122%. The low end is wave quantization, modelled
-> below. Built through shared-memory tiling, register tiling, vectorized
-> double-buffered loads, conflict-free shared reads, warp tiling, and a second
-> tile geometry chosen by that same quantization model, each step picked from a
-> Nsight Compute profile. Plus a FlashAttention-style attention kernel that
-> gains up to ~8.4× from query tiling. Every kernel is validated against a CPU
-> oracle. Device figures are measured on an RTX 3080 with locked clocks, over
-> ~200 ms of work per kernel, with cuBLAS timed in the same run.
+> below. Plus a FlashAttention-style attention kernel, up to ~8.4× from query
+> tiling. Every step was chosen from a Nsight Compute profile, every kernel is
+> checked against a CPU oracle, and device figures come from an RTX 3080 with
+> locked clocks, ~200 ms of work per kernel, cuBLAS timed in the same run.
 
 Optimized GEMM (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, single precision,
 row-major. The repo goes from a naive reference to tuned CPU and GPU kernels and
