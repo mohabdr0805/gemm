@@ -447,6 +447,13 @@ by `smsp__inst_executed_pipe_lsu.sum` gives 2.46 and 1.64, and that is the wrong
 denominator: it counts global traffic too, against a numerator that is shared
 only. The ×1.5 is the same either way.
 
+The disassembly agrees, which is the useful check on that ratio. `cuobjdump
+--dump-sass` on the `sm_86` cubin shows 32 `LDS.128` in both v5 and v6, and no
+narrower shared load in either: the instruction mix is identical, so the whole
+v6 gain is wavefronts per instruction and not instructions. It also settles a
+claim made earlier from `ptxas` behaviour alone, that the shared reads are
+fused into 128-bit loads. They are.
+
 It costs nothing to get there: 126 registers against v5's 128, the same 16 KB of
 shared, the same 33% occupancy. The group addressing computes one base per thread
 and constant offsets from it, which is cheaper than v5's `threadRow*TM + i`, so
@@ -630,6 +637,13 @@ puts every lane on the same bank, and no padding fixes it while keeping 16-byte
 alignment. So the last 6% is a different shared-memory addressing scheme, not a
 missing instruction.
 
+What the transpose costs is legible in the disassembly rather than inferred.
+Each thread stages four floats of A and four of B, and `cuobjdump --dump-sass`
+on v6 shows 2 `STS.128` against 8 plain `STS` per kernel, double-buffered, so
+one vectorized store per B tile and four scalar ones per A tile. B is contiguous
+on the way in and A is not, which is the same fact that stops `cp.async` from
+carrying it: the instruction copies bytes and cannot scatter them.
+
 A linear layer computes `Y = act(X·W + bias)`. Naively that is two kernels: the
 GEMM, then an element-wise pass for bias and activation, which writes the output
 and reads it all back. The fused kernel does the bias and activation in the GEMM
@@ -739,6 +753,37 @@ Because each block reads all of `K` and `V` once, v1's global traffic is
 `O(M·N·d)` with no `N×N` allocation. That is the central FlashAttention
 property, and also v1's ceiling: at long sequence length it re-reads `K`/`V`
 `M` times.
+
+That re-read is the ceiling usually quoted, but two more show up in `ptxas -v`
+before the kernel runs.
+
+**Shared sized for the worst case.** `d` is a runtime value, so `Ks`/`Vs` are
+declared `[BC][ATTN_DMAX+1]` and the kernel reserves 34 312 B per block whatever
+`d` is. v2 and FA-2 are templated on `d` and take only what they need:
+
+| `d` | v1 | v2 | FA-2 |
+|-----|----|----|------|
+| 32  | **34 312 B** | 8 448 B  | 8 192 B  |
+| 64  | **34 312 B** | 16 640 B | 16 384 B |
+| 128 | **34 312 B** | 33 024 B | 32 768 B |
+
+At `d=128` all three are comparable, so the problem is not that v1 is greedy, it
+is that v1 is flat: at `d=32` it reserves four times v2's shared for the same
+work. On the RTX 3080 that caps it at two blocks per SM, 17% occupancy, at every
+`d`. Shared is what binds, not registers: 40 registers per thread is 5 120 per
+block, and the 64 K register file would allow twelve.
+
+**Three warps in four idle on the expensive phase.** Scores are one thread per
+key (`if (tid < tile)`, `tile ≤ BC = 32`), so 32 of the block's 128 threads run
+the `d`-long dot product. That is not divergence: 32 threads is exactly one
+warp, so warps 1 to 3 retire the branch and wait at the barrier with no
+intra-warp serialization. Divergence costs execution slots, idleness costs
+scheduling slots, and at 17% occupancy those eight resident warps are what would
+otherwise hide the re-read above.
+
+Neither is worth fixing in v1, and both are gone by FA-2 (shared templated on
+`d`, one row per warp). They are recorded because the re-read is only part of
+the answer.
 
 ## Attention v2 — query tiling (`flash_attention_v2_kernel`)
 
