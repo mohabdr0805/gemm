@@ -249,9 +249,9 @@ raise arithmetic intensity, which is worth more than occupancy at this point.
 
 | kernel | registers/thread | shared/block | occupancy          | GFLOP/s (n=4096) |
 |--------|------------------|--------------|--------------------|------------------|
-| v1     | 37 (0 spill)     | 2176 B       | 100% (6 blocks/SM) | 1 551            |
-| v2     | 128 (0 spill)    | 8192 B       | 33% (2 blocks/SM)  | 12 865           |
-| v3     | 130 (0 spill)    | 16384 B      | 17% (1 block/SM)   | 16 283           |
+| v1     | 37 (0 spill)     | 2176 B       | 100% (6 blocks/SM) | 1 420            |
+| v2     | 128 (0 spill)    | 8192 B       | 33% (2 blocks/SM)  | 12 052           |
+| v3     | 130 (0 spill)    | 16384 B      | 17% (1 block/SM)   | 15 451           |
 | v4     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 15 797           |
 | v5     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 17 926           |
 | v6     | 126 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 18 472           |
