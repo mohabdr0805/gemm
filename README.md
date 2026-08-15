@@ -389,6 +389,22 @@ Measured (ncu, n=4096, kernels confirmed by name):
 | `mio_throttle`           | 17.4%       | 4.7%    |
 | `short_scoreboard`       | 12.0%       | 6.5%    |
 
+What "zero" means is worth stating, because it is narrower than it sounds and
+the difference is what v6 later collects. Isolating this exact read outside the
+GEMM, one `LDS.128` per warp: the strided version costs 8 wavefronts per
+instruction, the split version 4. So the counter did not remove the
+serialization, it removed the part of it that the memory layout was causing. The
+counter reports wavefronts **above the floor**, not the total, which is why 4
+remain at zero conflicts. Checked against four strides predicted in advance: at
+stride 16 it reports 12 conflicts and 16 wavefronts, at stride 32 it reports 28
+and 32. All four exact.
+
+Those remaining 4 wavefronts come from how many distinct addresses a warp asks
+for, not from banks, and no relayout can reach them. Changing *which lane reads
+what* can: v6 does exactly that and takes the same read from 4 wavefronts to 2,
+without `bank_conflicts` moving off zero. That is why the v6 gain is invisible on
+this counter, and it is the subject of the next section.
+
 Zero, not "near zero". On the bench it is the largest single step since v2:
 +8–10 points of cuBLAS at every size (v4 → v5: 79→89 at n=2048, 86→96 at
 n=3072, 80→87 at n=4096, 102→119 at n=1024), reproduced across two runs within
@@ -484,9 +500,20 @@ so the makespan is `ceil(blocks/68)` block-times while the work is `blocks/68`.
 | 2560 | 400    | 5.88 → 6  | 98.0%      | 20 490    | 20 477   |
 | 4096 | 1024   | 15.06 → 16| 94.1%      | 19 670    | 20 224   |
 
-One parameter, 13 of the 14 sizes tested inside 3%. The miss is n=1024, measured
-7.6% under: 64 blocks for 68 SMs never loads the card two-deep at all, which is
-outside what the model describes.
+One parameter, and on the full 25-size sweep 23 of them land inside 3%, mean
+error 1.7%, median 1.4%. The two misses are n=1024 at 5.7% and n=3328 at 3.6%.
+
+n=1024 is the interesting one and it marks the model's domain: 64 blocks for
+68 SMs means every SM gets at most one, so the card is never loaded two blocks
+deep, which is what the formula assumes. Naming that limit is worth more than
+adding a parameter to hide it.
+
+Two runs are involved and they use different plateaus, which is worth spelling
+out. The table above is the original 14-size derivation on a healthy card, fitted
+at 20 900 GFLOP/s. The 25-size check came later, on a sweep measured while the
+machine was running ~20% low, and refits to 16 953. The plateau is the model's one
+free parameter and absorbs the machine state; what the model predicts is the
+shape of the curve, and the shape survived a 20% hardware drift unchanged.
 
 So n=1152 at 76% of cuBLAS is not an inefficient kernel. It is 1.19 blocks per SM
 paid at the price of 2. Its Nsight profile agrees: the FMA pipe drops to 68% and
