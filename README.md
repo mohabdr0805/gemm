@@ -48,7 +48,7 @@ basic building block of an inference layer.
 
 Measured on an RTX 3080 10 GB (Ampere, `sm_86`) + i7-12700F (12C/20T), CUDA 13.0,
 Windows/MSVC. Methodology: clocks locked (`nvidia-smi -lgc 1710 -lmc 9501`, the
-card's spec boost — low enough that the power limiter never takes over, ~210 W
+card's spec boost, low enough that the power limiter never takes over, ~210 W
 against the 370 W cap), each kernel timed over ~200 ms of work after a warm-up,
 with the iteration count sized per kernel from a probe run and printed alongside
 the result, and cuBLAS timed in the same run. Each figure is one ~200 ms window,
@@ -59,47 +59,35 @@ GFLOP/s), not enforced by the harness.
 The lock is not decoration; both halves of it were bought with a mistake. This
 README's first numbers came from a session where the card was silently stuck in a
 low memory P-state: cuBLAS measured 9.6 TFLOP/s, 32% of the card's FP32 peak,
-a number no vendor SGEMM produces on healthy hardware — that is the sanity check
+a number no vendor SGEMM produces on healthy hardware, and that is the sanity check
 that caught it. And before the clocks were pinned, the v2/cuBLAS ratio drifted by
 5 points between sessions, more than some of the effects being measured.
 
-Sizing by time replaced a flat 50 iterations, which was not good enough at either
-end. At n=1024 v3 runs in 0.15 ms, so 50 iterations measured 7 ms and launch
-overhead left the v3/cuBLAS ratio swinging 87–113% between runs; it now sits at
-~104%, stable. At n=4096 v1 runs in 100 ms, so the same 50 iterations soaked the card
-for 5 s and moved the clocks under everything timed after it. Equal time per
-kernel fixes both.
+Sizing by time replaced a flat 50 iterations, which was not good enough at
+either end. At n=1024 v3 runs in 0.15 ms, so 50 iterations measured 7 ms and
+launch overhead left the v3/cuBLAS ratio swinging 87–113% between runs; it now
+sits at ~104%, stable. At n=4096 v1 runs in 100 ms, so the same 50 iterations
+soaked the card for 5 s and moved the clocks under everything timed after it.
+Equal time per kernel fixes the first and bounds the second, and locking the
+clocks removes it.
 
-The inputs rotate. NVIDIA's GEMM measurement guidelines ask for enough copies of
-the input to cover twice the L2, cycled through so that iteration i+1 cannot read
-what iteration i left in cache; the harness sizes that count from
-`cudaDeviceProp::l2CacheSize` at run time. On this card it only binds below
-n=1145, since past that A and B exceed 10 MB on their own.
-
-It changed nothing on GEMM, and that is the useful part. An alternated in-place
-A/B, where the buffer index is the only difference between the two timings, puts
-n=1024 inside the run-to-run spread: six rounds span −2.1% to +0.2% for v6 and
-−0.0% to +1.3% for cuBLAS, with no consistent sign. A GEMM at that size moves
-12 MB per launch against a 5 MB L2, so it evicts its own inputs long before the
-next iteration starts. The 122% was not a caching artifact.
-
-That claim needs the instrument to be able to detect one, so: a read-only
-streaming kernel over a buffer small enough to stay L2-resident, same harness,
-measures 504 GB/s with a fixed buffer and 333 GB/s rotating, 6 rounds out of 6.
-Where there is carryover, the rotation finds it. Where the same test is run at
-32 MB, well past the L2, it reports 1.00×, no effect, as it should.
-
-Attention is the benchmark that was actually flattered. At n=4096, d=64 the whole
-working set is 4 MB and fits in L2, and the same A/B puts the rotation at −10% on
-`flash_attention_v2_kernel`, 6 rounds out of 6, at both n=1024 and n=4096. Its
-table below is measured with rotation on. Softmax measured clean (0.0–0.6%) and
-rotates anyway, because one protocol across the three benchmarks is worth more
-than the memory it saves.
+The inputs rotate, per NVIDIA's GEMM measurement guidelines: enough copies to
+cover twice the L2, cycled so that iteration i+1 cannot read what iteration i
+left in cache. It changed nothing on GEMM, which is the useful part. An
+alternated A/B, where the buffer index is the only difference between the two
+timings, leaves n=1024 inside the run-to-run spread with no consistent sign over
+six rounds: a GEMM at that size moves 12 MB per launch against a 5 MB L2 and
+evicts its own inputs. The 122% is not a caching artifact. That the instrument
+could have found one is a separate check, on a read-only streaming kernel small
+enough to stay L2-resident: 504 GB/s with a fixed buffer against 333 GB/s
+rotating, and 1.00× at 32 MB, well past the L2. Attention is the benchmark that
+was actually flattered, and its own section carries the figure. All three rotate
+regardless, softmax included, where it measures clean.
 
 *Scope: FP32 on CUDA cores throughout (no tensor cores). The cuBLAS baseline
 runs in its default math mode (plain `cublasSgemm`, no `cublasSetMathMode`), so
 TF32 is disabled and the comparison is like-for-like. Cross-check: cuBLAS
-matches the FP32 CPU oracle to ~7e-6, where TF32's 10-bit mantissa would give
+matches the FP32 CPU oracle to ~1e-5, where TF32's 10-bit mantissa would give
 errors around 1e-3. The baseline is cuBLAS's default heuristic kernel choice via
 `cublasSgemm`, not an exhaustive `cublasLt` algorithm search; that is the field
 standard for this comparison, and it is what sets the ceiling. One card
@@ -113,16 +101,9 @@ End-to-end GFLOP/s (whole wrapper: cudaMalloc + H2D/D2H + kernel):
 | 2048 | —     | 202                     | 917            |
 | 4096 | —     | 198                     | 1 162          |
 
-*The CPU column replaces an earlier 83 / 161 / 209, under two separate causes.
-(1) `gemm_tiled` used to carry `collapse(2)`, which MSVC silently ignores
-(warning C4849 on every build), so only the `ii` loop was parallel; fusing the two
-tile loops by hand gives +29% at n=2048, +18% at n=1024 and +6% at n=4096,
-measured A/B at identical flags, bit-identical results. (2) The host benchmark now
-reports the best of several runs instead of a single shot: at n=1024 the whole
-GEMM takes ~20 ms, and one measurement swings by a factor of two on fork/join
-alone (~97 GFLOP/s single shot against ~188 best-of-five, same binary). So most of
-the 83 → 188 at n=1024 is (2), most of the 161 → 202 at n=2048 is (1), and at
-n=4096 the figure moves **down**, 209 → 198: the old single shot was a lucky one.*
+*The CPU figures are best-of-five, not single-shot: at n=1024 the whole GEMM takes
+~20 ms, and a single measurement swings by a factor of two on fork/join alone
+(~97 GFLOP/s single shot against ~188 best-of-five, same binary).*
 
 *Footnote: the end-to-end row is one timed call including `cudaMalloc` and both
 transfers, so it measures the wrapper, not the kernel. It climbs with n while the
@@ -176,24 +157,24 @@ for the 3080's 68 SMs and fills fewer than half of them (wave quantization):
 8 849 GFLOP/s against ~12 000 at larger n. The ratio hides it because cuBLAS
 underfills at n=1024 too (13 732, its own worst size).
 
-v3 beats cuBLAS at n=1024 for the same reason it costs at n=4096: it needs 130
-registers, so only one block fits per SM (see below), which means 68 slots, and
-n=1024 supplies 64 blocks. The property that halves its occupancy is what leaves
-it nearly full when the grid is small.
+v3 beats cuBLAS at n=1024 for the same reason it costs at n=4096: 130 registers
+hold it to one block per SM. At n=1024 the grid supplies 64 blocks for 68 SMs,
+so no kernel gets a second block. v2 drops from two per SM to one and loses half
+its residency; v3 was already at one and loses nothing.
 
 **Four sizes are not a benchmark.** Those four are the round numbers everyone
 quotes, and they hide how much the ratio moves with shape, so the aligned range
 was swept in steps of 128 from n=1024 to 4096, 25 sizes, medians of three
-alternated measurements. **v6 is above cuBLAS on 12 of the 25, against 5 for
-v5.** The curve oscillates because both kernels quantize into waves and they do
-not quantize the same way: v6's own throughput is nearly flat (16.7–19.4
-TFLOP/s), while cuBLAS swings from 13.7 to 21.0 with peaks at the powers of two,
-where it evidently ships a size-specific kernel. So the losses cluster at 2048
-and 4096, and the wins where cuBLAS has nothing special. One size is genuinely
-bad on our side: n=1152 sits at 76%, its 81 blocks leaving the card 60% filled
-whichever `__launch_bounds__` build runs. `ctest` checks every kernel, cuBLAS
-included, against the CPU oracle (max error ~1e-5, tolerance 1e-3). The
-benchmark does not check correctness.
+alternated measurements. **With the 128×128 tile alone, v6 is above cuBLAS on 12
+of the 25, against 5 for v5**, and on 13 once the second geometry ships. The
+curve oscillates because both kernels quantize into waves and they do not
+quantize the same way. Ours is nearly flat, 16.7–19.4 TFLOP/s over the 25
+shapes; cuBLAS covers 13.7 to 21.0, swinging with which of its kernels each
+shape selects, six different ones across the sweep. Our biggest losses are
+against its 256×128 tile. One size is genuinely bad on our side: n=1152 sits at
+76%, its 81 blocks leaving the card 60% filled whichever `__launch_bounds__`
+build runs. `ctest` checks every kernel, cuBLAS included, against the CPU oracle
+(max error ~1e-5, tolerance 1e-3). The benchmark does not check correctness.
 
 ## CPU — `gemm_tiled`
 
@@ -202,25 +183,18 @@ thread, so there is no data race and no reduction. The inner i-k-j order keeps B
 and C accessed row by row.
 
 The two tile loops are **fused by hand** into a single loop over the tile index
-instead of carrying `collapse(2)`. MSVC needs `/openmp:experimental` for the
-`omp simd` below; that mode is OpenMP 2.0 + simd and it ignores `collapse`, saying
-so on every build (`warning C4849`). Only the `ii` loop was parallel: M/64
-iterations to fill 20 threads. The binary also linked `VCOMP140.DLL`, the
-OpenMP 2.0 runtime, which is the same fact from the other side.
-`/openmp:llvm` honours `collapse` but rejects `omp simd` (`error C7660`), so no
-single MSVC flag buys both. Fusing needs no clause at all, works on every
-compiler, and gives +29% at n=2048 (see the table footnote above).
+rather than carrying `collapse(2)`: the only MSVC OpenMP mode that accepts the
+`omp simd` below ignores `collapse`, leaving just the `ii` loop parallel, 32 tile
+rows for 20 threads at n=2048. Fusing needs no clause, runs on every compiler,
+and is worth +29% there, measured A/B at identical flags with bit-identical
+results.
 
 Row access is only half the point of that loop order; the other half is SIMD.
 The inner `Crow[j] += a * Brow[j]` over contiguous floats maps onto 8-wide AVX2
-FMAs, worth 7.8× single-threaded (3.8 → 29.4 GFLOP/s). MSVC needed three
-explicit steps to emit them: `/arch:AVX2` (x64 defaults to 4-wide SSE2; the
-flag is guarded by `GEMM_NATIVE` since AVX2 binaries crash on pre-2013 CPUs),
-`#pragma omp simd` + `__restrict` (MSVC refuses to auto-vectorize
-`C[i*N+j] += a*B[k*N+j]` because it assumes C may alias B, `/Qvec-report`
-reason 1200; GCC emits a runtime overlap check instead), and hoisted row
-pointers (the vectorizer also rejects the mixed `(size_t)i*N + j` addressing).
-`/Qvec-report:2` confirms: `C5001: omp simd loop vectorized`.
+FMAs, worth 7.8× single-threaded (3.8 → 29.4 GFLOP/s). Getting MSVC to emit them
+took `/arch:AVX2` and a rewrite: it assumes C may alias B and gives up rather
+than emit the runtime overlap check GCC uses, so the row pointers are hoisted and
+marked `__restrict` under `#pragma omp simd`.
 
 ## GPU v1 — `gemm_kernel`
 
@@ -273,18 +247,14 @@ The v4 row is the same kernel forced back under the cliff with
 cheaper than v3's, so the kernel sits on the cliff naturally.
 
 **The geometry is measured, not assumed.** The 128×128×8 block tile with an 8×8
-micro-block was chosen at v2 and never re-examined, so the kernel was
-parametrized on `<BM, BN, BK, TM, TN>` and twelve valid configurations were
-swept at n=4096, each validated against the CPU oracle before being timed. None
-beat the original: 128×64 reaches 80% of cuBLAS, 64×128 76%, and the 512-thread
-configurations that trade arithmetic intensity for occupancy land at 71%, the
-worst of the set. Larger tiles do have the better ratio on paper (256×128×8
-loads 3072 floats for 262144 FMAs, 85 per float against 64) and still lose,
-because the register budget bites before the intensity pays. 256×256 with a
-16×16 micro-block is the limit case: `acc` alone needs 256 registers against the
-255 available, and it runs 23× slower. The parametrized kernel is not shipped,
-since it found nothing faster than what is already here; the sweep is the
-result.
+micro-block wins a sweep of twelve valid `<BM, BN, BK, TM, TN>` configurations at
+n=4096, each validated against the CPU oracle before being timed: 128×64 reaches
+80% of cuBLAS, 64×128 76%, and the 512-thread configurations that trade
+arithmetic intensity for occupancy land at 71%, the worst of the set. Larger
+tiles do have the better ratio on paper (256×128×8 loads 3072 floats for 262144
+FMAs, 85 per float against 64) and still lose, because the register budget bites
+before the intensity pays. 256×256 with a 16×16 micro-block is the limit case:
+`acc` alone needs 256 registers against the 255 available, and it runs 23× slower.
 
 ## GPU v3 — `gemm_reg_v3db_kernel` (float4 + double buffering)
 
@@ -294,13 +264,15 @@ top warp stalls were global-load latency (`long_scoreboard`) and shared-load
 bank conflicts, with ~268M shared-load bank conflicts reported. Two changes
 followed, each checked by re-profiling.
 
-First, vectorized `float4` global loads plus a transposed As tile (so the
-compute loop reads contiguous shared rows). This was worth several points of
-cuBLAS, but the re-profile was a useful correction: the bank-conflict count did
-not move (the dominant conflict is on the Bs read, which this did not touch), so
-the gain came from issuing a quarter as many global-load instructions, not from
-the conflicts. It also left global-load latency as the new top stall
-(`long_scoreboard` rose from ~12% to ~16%).
+First, vectorized `float4` global loads plus a transposed As tile. This was
+worth several points of cuBLAS, but the re-profile was a useful correction: the
+bank-conflict count did not move (the dominant conflict is on the Bs read, which
+this did not touch), so the gain came from issuing a quarter as many global-load
+instructions, not from the conflicts. The transpose was meant to fix those
+conflicts and missed; it stays because it makes the compute loop's A read
+contiguous: two `LDS.128` instead of eight scalar loads. The change also left
+global-load latency as the new top stall (`long_scoreboard` rose from ~12% to
+~16%).
 
 Second, double buffering. Two shared buffers: each step issues the next tile's
 global loads into registers up front (in flight while the current tile is
@@ -341,7 +313,7 @@ builds. Told to fit two blocks per SM, `ptxas` lands exactly on the 128-register
 cliff with zero spill, and occupancy doubles (17% → 33%).
 
 It does what it was aimed at: `short_scoreboard` halves (24.3% → 11.9%) and
-`long_scoreboard` all but vanishes (2.3% → 0.1%). Yet the net is +2–3 points of
+`long_scoreboard` falls from 2.3% to 0.1%. Yet the net is +2–3 points of
 cuBLAS at n ≥ 2048, not more, and the stall table says why: `mio_throttle`
 triples (5.5% → 17.4%) and takes over as the top stall. Two blocks per SM put
 twice the warps on one LSU pipe, and that pipe still carries the ~268M Bs bank
@@ -352,29 +324,27 @@ At n=1024 v4 *loses* ~2 points, consistently. Squeezing into 128 registers is
 not free even with zero spill (`ptxas` recomputes addresses it would otherwise
 keep live), and that cost is paid per thread whether or not the second block
 ever lands. A 64-block grid on 68 SMs runs one block per SM regardless, so v4
-pays without collecting; the first guess was that the extra occupancy would
-be harmless there, and the measurement said otherwise. So `gemm_cuda_v3`
-dispatches on grid size: the 128-register build once the grid can seat two
-blocks per SM, the 130-register build below that. Same kernel, two `ptxas`
-budgets, picked per shape — the FA-2 dispatch argument again, one level down.
+pays without collecting. `gemm_cuda_v3` therefore dispatches on grid size: the
+128-register build once the grid can seat two blocks per SM, the 130-register
+build below that, the same per-shape dispatch as FA-2 one level down.
 
 Next lever, and the profile had now named it twice: the Bs bank conflicts.
 That is v5, below.
 
 ## GPU v5 — `gemm_reg_v5_kernel` (conflict-free Bs reads)
 
-The conflicts have an address. In the compute loop each thread read its 8 output
-columns as one contiguous group at `threadCol * 8`: sixteen threadCols spaced 8
-floats apart land on `(8·tc) mod 32 ∈ {0, 8, 16, 24}` — four of the 32 banks, a
-4-way conflict on every Bs read. A back-of-envelope check says these are the
-conflicts ncu has been counting all along: the kernel issues 67.1M Bs load
-instructions at n=4096, and the counter read 268 435 456, exactly 4× that.
+The conflict is in the Bs read, where each thread took its 8 output columns as
+one contiguous group at `threadCol * 8`: sixteen threadCols spaced 8 floats
+apart land on `(8·tc) mod 32 ∈ {0, 8, 16, 24}`, four of the 32 banks, a 4-way
+conflict on every Bs read. The count matches exactly: the kernel issues 67.1M Bs
+load instructions at n=4096 and the counter reads 268 435 456, four per
+instruction, so these are all of them and not most of them.
 
 The As read never conflicts, which is why the v3 transpose could not move the
 counter: `threadRow` takes only 2 values per warp, so the As read is a
 broadcast. The fix therefore only touches Bs ownership: each thread's 8 columns
 split into two groups of 4, at `threadCol*4` and `threadCol*4 + 64`. A warp's
-sixteen threadCols then read 128 contiguous floats — all 32 banks. Staging,
+sixteen threadCols then read 128 contiguous floats, all 32 banks. Staging,
 tile layout and the FMA loop are untouched; the epilogue moves with the
 ownership.
 
@@ -397,7 +367,7 @@ serialization, it removed the part of it that the memory layout was causing. The
 counter reports wavefronts **above the floor**, not the total, which is why 4
 remain at zero conflicts. Checked against four strides predicted in advance: at
 stride 16 it reports 12 conflicts and 16 wavefronts, at stride 32 it reports 28
-and 32. All four exact.
+and 32, and all four are exact.
 
 Those remaining 4 wavefronts come from how many distinct addresses a warp asks
 for, not from banks, and no relayout can reach them. Changing *which lane reads
@@ -413,7 +383,7 @@ LSU pipe stopped hurting once the pipe stopped replaying conflicts.
 
 Two smaller facts the measurement adds. The split addressing costs 128
 registers where v3's cost 130, so v5 sits on the 2-blocks/SM cliff without
-`__launch_bounds__` — yet the hint still changes scheduling enough to measure,
+`__launch_bounds__`, yet the hint still changes scheduling enough to measure,
 ~1 point up at n ≥ 2048 and ~3.5 points down at n=1024, so the grid dispatch
 stays. And the staging side keeps a residual 16.5M store conflicts (the
 transposed As scatter), two orders of magnitude below where the load conflicts
@@ -430,12 +400,11 @@ lanes then read 2 distinct rows of As, which broadcasts for free, and 16 distinc
 column groups of Bs, which does not. v5 removed the bank conflicts on that read
 but not its width.
 
-v6 gives each warp an explicit 128×16 tile, which flips the ratio: 16 distinct As
-rows and 2 distinct Bs column groups. The instruction count does not move
+v6 gives each warp an explicit 128×16 tile, which flips the ratio: 16 distinct
+As rows and 2 distinct Bs column groups. The instruction count does not move
 (`smsp__inst_executed_op_shared_ld` is identical to the byte), but the accesses
-coalesce into a third fewer wavefronts, 402M down to 268M, or 3.0 per shared-load
-instruction down to 2.0. That is the whole mechanism, and it is worth about 4% at
-every size.
+coalesce into a third fewer wavefronts, 402M down to 268M, or 3.0 per
+shared-load instruction down to 2.0. It is worth about 4% at every size.
 
 The elongated warp tile was not the prediction. A square 64×32 looked right,
 since it minimises the total distinct addresses a warp touches; it measures at
@@ -466,9 +435,9 @@ only. The ×1.5 is the same either way.
 The disassembly agrees, which is the useful check on that ratio. `cuobjdump
 --dump-sass` on the `sm_86` cubin shows 32 `LDS.128` in both v5 and v6, and no
 narrower shared load in either: the instruction mix is identical, so the whole
-v6 gain is wavefronts per instruction and not instructions. It also settles a
-claim made earlier from `ptxas` behaviour alone, that the shared reads are
-fused into 128-bit loads. They are.
+v6 gain is wavefronts per instruction and not instructions. It also confirms a
+claim made earlier from `ptxas` behaviour alone: the shared reads are fused into
+128-bit loads.
 
 It costs nothing to get there: 126 registers against v5's 128, the same 16 KB of
 shared, the same 33% occupancy. The group addressing computes one base per thread
@@ -479,7 +448,7 @@ One measurement note worth keeping. Nsight Compute reports v6 and v5 within 0.3%
 of each other, while the benchmark shows 5%. Both are right about different
 things: ncu profiles one launch in isolation, at base clocks, with caches
 flushed, and the benchmark runs two dozen back to back. The structural counters
-above are what ncu is for; its wall time, for this kernel, is not.
+above are what ncu is for; its wall time is not.
 
 ## Where the remaining variation comes from
 
@@ -548,12 +517,12 @@ is 405 partials, 53 MB of workspace traffic round trip, against a GEMM that runs
 in 0.24 ms.
 
 Taking the best of the three at every size moves n=1152 from 76% to 93%, n=1280
-from 92% to 97%, n=1536 from 94% to 98%, and nothing anywhere else: only 3 of the
-25 swept sizes have an efficiency below 75%, and past that `ceil` stops mattering.
-None of the three crosses 100%, so the count of sizes beating cuBLAS stays at 12
-of 25. Against that, two more kernels, a device workspace to size and own, and a
-public API that has to carry it. The measurement is worth more here than the
-kernels, so the kernels stayed out.
+from 92% to 97%, n=1536 from 94% to 98%, and nothing anywhere else: only 3 of
+the 25 swept sizes have an efficiency below 75%, and past that `ceil` stops
+mattering. None of the three crosses 100%, so the count of sizes beating cuBLAS
+stays at 12 of 25. Against that, two more kernels, and a device workspace for
+the partial tiles that every caller would have to allocate, since the API takes
+pointers and nothing else. So the kernels stayed out.
 
 The projection that started this was wrong, and by a lot: dividing the current
 figure by the efficiency predicted 76% → 127% and 22 of 25 sizes. That ceiling
@@ -589,10 +558,10 @@ neither kernel is bandwidth-bound, so the gap to cuBLAS is not a memory-traffic
 problem. The L2 absorbs two thirds of the panel re-reads, 4.4 GB of L2 traffic
 against 1.47 GB reaching DRAM.
 
-That geometry had already been swept, and lost at 86% of cuBLAS. The sweep ran it
-on the v5 body, with no warp tier. On the warp-tiled body it reaches 94%: the
-warp tier is worth 7.6 points here against 4.9% on 128×128. A negative autotune
-result holds for the body it was measured on, not for the geometry.
+That geometry had already been swept, and lost at 86% of cuBLAS. The sweep had
+compiled it into v5's inner loop, so it is the loop that changed, not the tile.
+On the warp-tiled loop it reaches 94%: the warp tier is worth 7.6 points here
+against 4.9% on 128×128.
 
 Both tiles ship, and the dispatch is the quantization model again. The 256×128
 grid is half the size, so it lands differently on the SM count: it wins whenever
@@ -695,12 +664,8 @@ clocks locked, rotated inputs, two runs agreeing within 0.01:
 | 512³ | 1.02× |
 | 256³ | 1.11× |
 
-These replace an earlier 0.97–1.16× / 0.91× / 1.35× / 1.17× / "~1.5–2× on tiny
-matrices", measured before the clocks were locked and before the harness sized
-its windows by time. Every one of them was off, and the 0.91× was off in sign:
-the thin-K case is a gain, not a loss. The shape of the effect survives, the
-amplitude does not. Fusion here is a consistent ~1.1× where the saved pass is a
-real fraction of the work, and nothing at all where it is not.
+Fusion here is a consistent ~1.1× where the saved pass is a real fraction of the
+work, and nothing at all where it is not.
 
 One caveat: the epilogue is currently fused into the v1 tiling, while the
 register-tiled v2 is ~10× faster as a plain GEMM. Templating the epilogue into
@@ -835,13 +800,7 @@ stores and 3 100 B of spill loads per thread). v2 still wins
 there, because the `K`/`V` reuse more than pays for the spill traffic, but by a
 smaller margin.
 
-Sizing the iteration count by time matters for the ratio here, not just the
-absolute: under the flat 50 iterations this table used to run, v1 (20 ms/iter at
-n=4096) soaked the card for a second before v2 was timed, and the speedup came
-out ~11× against the ~8.4× measured now, with clocks locked, over equal ~200 ms
-windows. "Timed in the same power state" was the claim; the fixed count was
-quietly breaking it. On an RTX 3080 (`sm_86`), `n×n`, full attention, device
-timing:
+On an RTX 3080 (`sm_86`), `n×n`, full attention, device timing:
 
 | n    | speedup d=64 | speedup d=128 |
 |------|--------------|---------------|
@@ -892,11 +851,9 @@ Measured on an RTX 3080, `n×n`, full attention, GFLOP/s:
 | 4096 | 955      | 1557       | 1.63×   | 1772    | 1305      | 0.74×   |
 
 Rotated inputs, median of three runs from separate processes that agreed within
-0.5%. The rotation costs ~10% here, which is the point of it: at these sizes Q, K
-and V fit in L2 and a fixed-buffer loop was timing a cache. That 10% is the A/B
-figure, where the buffer index is the only thing that differs. It is not the gap
-between this table and the one it replaces: that older table also predates the
-warm-up pass, and some of its entries were too low rather than too high.
+0.5%. The rotation costs ~10% here, which is the point of it: at these sizes Q,
+K and V fit in L2 and a fixed-buffer loop was timing a cache. That 10% is the
+A/B figure, where the buffer index is the only thing that differs.
 
 At d=128 FA-2 wins at every size: no spill, and a flat ~1350–1550 GFLOP/s
 regardless of n. At d=64, where v2 does not spill, it is a trade-off. FA-2 gives
