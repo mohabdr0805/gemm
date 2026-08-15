@@ -152,15 +152,19 @@ v1 sits at 7–11% of cuBLAS; register tiling is 6–8.5× over it, and the gap 
 with n.
 
 Grid underfill at n=1024 is visible in v2's absolute throughput, not in its
-ratio: 128×128 tiles produce 64 blocks, and v2 fits 2 per SM, so it has 136 slots
-for the 3080's 68 SMs and fills fewer than half of them (wave quantization):
-8 849 GFLOP/s against ~12 000 at larger n. The ratio hides it because cuBLAS
-underfills at n=1024 too (13 732, its own worst size).
+ratio: 128×128 tiles produce 64 blocks for 68 SMs, so every SM gets one and none
+gets the second its register budget allows. Half the resident warps, 8 849
+GFLOP/s against ~12 000 at larger n. That is a residency loss, not the wave
+quantization modelled below, which at 64 blocks over 68 SMs would cost 6% and
+not 26%. The ratio hides it because n=1024 is cuBLAS's worst size too (13 732),
+though not for the same reason: it dispatches to its smallest tile there,
+`ampere_sgemm_64x64_nn`. Its 256 blocks quantize identically to our 64, 94.1%
+either way, so what separates them is traffic: a 64×64 tile reads twice the
+bytes for the same FMAs.
 
 v3 beats cuBLAS at n=1024 for the same reason it costs at n=4096: 130 registers
-hold it to one block per SM. At n=1024 the grid supplies 64 blocks for 68 SMs,
-so no kernel gets a second block. v2 drops from two per SM to one and loses half
-its residency; v3 was already at one and loses nothing.
+hold it to one block per SM. Where v2 loses half its residency at that size, v3
+was already at one block and loses nothing.
 
 **Four sizes are not a benchmark.** Those four are the round numbers everyone
 quotes, and they hide how much the ratio moves with shape, so the aligned range
