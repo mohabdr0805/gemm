@@ -234,8 +234,7 @@ Occupancy falls 100% → 33% → 17% down the first three rows while throughput
 rises 1 420 → 12 052 → 15 451. v1 sits at 100% theoretical occupancy yet runs
 8.5× slower than v2 at a third of the occupancy: one output per thread gives too
 little reuse per load, so v1 is limited by arithmetic intensity, not occupancy.
-Past full occupancy, arithmetic intensity is the only lever left; past that,
-latency hiding, which is what v3 buys with the rest of its occupancy.
+v3 then traded some occupancy again, this time for latency hiding.
 
 The v3 row also shows how sharp the cliff is. Two blocks per SM need
 `regs × 256 × 2 ≤ 65536`, so the limit is 128 registers/thread: v2 sits exactly
