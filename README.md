@@ -384,24 +384,26 @@ points of cuBLAS at n=2048 and n=3072, +7 at n=4096 and +17 at n=1024 (v4 → v5
 v4's bill is paid: the pressure that doubling the warps put on the LSU pipe
 stopped hurting once the pipe stopped replaying conflicts.
 
-Two smaller facts the measurement adds. The split addressing costs 128
-registers where v3's cost 130, so v5 sits on the 2-blocks/SM cliff without
-`__launch_bounds__`, yet the hint still changes scheduling enough to measure,
-~1 point up at n ≥ 2048 and ~3.5 points down at n=1024, so the grid dispatch
-stays. And the staging side keeps a residual 16.5M store conflicts (the
+Two smaller facts the measurement adds. The split addressing costs 128 registers
+where v3's cost 130, so v5 sits on the 2-blocks/SM cliff without
+`__launch_bounds__`, yet the hint still changes the code ptxas emits: both
+builds hold 128 registers, 0 spill and the same 576 FFMA, but one is 968
+instructions against 984 and assigns registers differently throughout. Worth ~1
+point of cuBLAS at n ≥ 2048 and 2 to 3.5 the other way at n=1024, so the grid
+dispatch stays. And the staging side keeps a residual 16.5M store conflicts (the
 transposed As scatter), two orders of magnitude below where the load conflicts
-were; with `mio_throttle` at 4.7% the profile now points at `barrier` (8.7%)
-and the remaining shared latency, which v6 goes after.
+were; with `mio_throttle` at 4.7% the profile now points at `barrier` (8.7%) and
+the remaining shared latency, which v6 goes after.
 
 ## GPU v6 — `gemm_reg_v6_kernel` (warp tiling)
 
 Up to v5 the kernel has two tiers, the block tile and the thread tile, and
 nothing in between. That leaves the warp shape to fall out of the thread
 indexing: `threadRow = tid/16` takes two values across 32 consecutive lanes and
-`threadCol = tid%16` takes sixteen, so a warp covers a 16×128 sliver. Its 32
-lanes then read 2 distinct rows of As, which broadcasts for free, and 16 distinct
-column groups of Bs, which does not. v5 removed the bank conflicts on that read
-but not its width.
+`threadCol = tid%16` takes sixteen, so a warp covers a 16×128 strip. Its 32
+lanes then read 2 distinct rows of As, which broadcasts for free, and 16
+distinct column groups of Bs, which does not. v5 removed the bank conflicts on
+that read but not its width.
 
 v6 gives each warp an explicit 128×16 tile, which flips the ratio: 16 distinct
 As rows and 2 distinct Bs column groups. The instruction count does not move
@@ -444,108 +446,91 @@ claim made earlier from `ptxas` behaviour alone: the shared reads are fused into
 128-bit loads.
 
 It costs nothing to get there: 126 registers against v5's 128, the same 16 KB of
-shared, the same 33% occupancy. The group addressing computes one base per thread
-and constant offsets from it, which is cheaper than v5's `threadRow*TM + i`, so
-the warp tier actually hands two registers back.
+shared, the same 33% occupancy. The warp tier hands two registers back rather
+than taking any.
 
-One measurement note worth keeping. Nsight Compute reports v6 and v5 within 0.3%
-of each other, while the benchmark shows 5%. Both are right about different
-things: ncu profiles one launch in isolation, at base clocks, with caches
-flushed, and the benchmark runs two dozen back to back. The structural counters
-above are what ncu is for; its wall time is not.
+Nsight Compute reports v6 and v5 within 0.3% of each other where the benchmark
+shows 5%: it profiles one launch in isolation, at base clocks, with caches
+flushed, while the benchmark runs two dozen back to back. Its counters are what
+the section above uses, not its wall time.
 
 ## Where the remaining variation comes from
 
 v6 swings between 12 500 and 20 500 GFLOP/s across the sweep, and the low points
-read as a weak kernel. They are not. The whole curve is wave quantization, and
-the quantum is the SM rather than the 2-blocks/SM wave: 68 blocks run at a time,
-so the makespan is `ceil(blocks/68)` block-times while the work is `blocks/68`.
+read as a weak kernel. The whole curve is wave quantization, and the quantum is
+the SM rather than the 2-blocks/SM wave: 68 blocks run at a time, so the
+makespan is `ceil(blocks/68)` block-times while the work is `blocks/68`.
 
     efficiency = (blocks/68) / ceil(blocks/68),  blocks = (M/128)·(N/128)
-    throughput = efficiency × 20 900 GFLOP/s
+    throughput = efficiency × plateau
+
+The plateau is the model's only free parameter: what the kernel reaches when the
+grid divides evenly and quantization costs nothing. Least squares over the 25, a
+line through the origin, puts it at 21 029 GFLOP/s. Seven of the 25:
 
 | n    | blocks | blocks/68 | efficiency | predicted | measured |
 |------|--------|-----------|------------|-----------|----------|
-| 1152 | 81     | 1.19 → 2  | 59.6%      | 12 450    | 12 489   |
-| 1280 | 100    | 1.47 → 2  | 73.5%      | 15 370    | 15 358   |
-| 1536 | 144    | 2.12 → 3  | 70.6%      | 14 760    | 14 860   |
-| 1792 | 196    | 2.88 → 3  | 96.1%      | 20 090    | 20 027   |
-| 2560 | 400    | 5.88 → 6  | 98.0%      | 20 490    | 20 477   |
-| 4096 | 1024   | 15.06 → 16| 94.1%      | 19 670    | 20 224   |
+| 1024 | 64     | 0.94 → 1  | 94.1%      | 19 792    | 18 229   |
+| 1152 | 81     | 1.19 → 2  | 59.6%      | 12 525    | 12 495   |
+| 1536 | 144    | 2.12 → 3  | 70.6%      | 14 844    | 14 862   |
+| 1792 | 196    | 2.88 → 3  | 96.1%      | 20 205    | 19 921   |
+| 2560 | 400    | 5.88 → 6  | 98.0%      | 20 617    | 20 458   |
+| 3328 | 676    | 9.94 → 10 | 99.4%      | 20 906    | 20 654   |
+| 4096 | 1024   | 15.06 → 16| 94.1%      | 19 792    | 20 024   |
 
-One parameter, and on the full 25-size sweep 23 of them land inside 3%, mean
-error 1.7%, median 1.4%. The two misses are n=1024 at 5.7% and n=3328 at 3.6%.
+Across the 25, 24 land inside 3%, mean error 1.1%, median 0.8%. The one miss is
+n=1024, and it marks the model's domain. It has the same efficiency as n=4096 and
+the same prediction, yet lands 8.6% off where n=4096 is 1.2%: 64 blocks for 68
+SMs means every SM gets at most one, so the card is never loaded two blocks deep,
+which is what the formula assumes. Naming that limit is worth more than adding a
+parameter to hide it.
 
-n=1024 is the interesting one and it marks the model's domain: 64 blocks for
-68 SMs means every SM gets at most one, so the card is never loaded two blocks
-deep, which is what the formula assumes. Naming that limit is worth more than
-adding a parameter to hide it.
-
-Two runs are involved and they use different plateaus, which is worth spelling
-out. The table above is the original 14-size derivation on a healthy card, fitted
-at 20 900 GFLOP/s. The 25-size check came later, on a sweep measured while the
-machine was running ~20% low, and refits to 16 953. The plateau is the model's one
-free parameter and absorbs the machine state; what the model predicts is the
-shape of the curve, and the shape survived a 20% hardware drift unchanged.
-
-So n=1152 at 76% of cuBLAS is not an inefficient kernel. It is 1.19 blocks per SM
-paid at the price of 2. Its Nsight profile agrees: the FMA pipe drops to 68% and
-active warps to 21%, but `long_scoreboard` sits at 0.09% and `not_selected` at
-49%, which says the scheduler has more eligible warps than issue slots. There is
-no latency being missed. Nothing done to the inner loop can move that size.
+So n=1152 at 76% of cuBLAS is not an inefficient kernel. It is 1.19 blocks per
+SM paid at the price of 2. Its Nsight profile agrees: the FMA pipe drops to 68%
+and active warps to 21%, but `long_scoreboard` sits at 0.09% and `not_selected`
+at 49%, which says the scheduler has more eligible warps than issue slots, so no
+latency is being missed and nothing done to the inner loop can move that size.
 
 ### The fix exists, was built, and is not here
 
 The standard answer is Stream-K: count the work in K-loop iterations rather than
 output tiles, launch a fixed number of blocks, and give each an equal slice, so a
 slice may start mid-tile and end mid-tile. Partial tiles go to a workspace and a
-second kernel recombines them. It is implemented and validated against cuBLAS on
+second kernel recombines them. Implemented here and validated against cuBLAS on
 11 shapes, including a single tile split across 128 blocks.
 
-It works, at n=1152: 12 483 → 15 286 GFLOP/s, 76% of cuBLAS to 93%.
+It buys the troughs: n=1152 goes from 76% of cuBLAS to 93%. It costs 19
+registers, because a block spanning several output tiles keeps about a dozen
+values live across the whole compute loop, and v6 had two of headroom. Capped at
+128 for two blocks per SM it spills 76 bytes; at 147 with no spill it runs one
+block per SM. Either way the large sizes lose ~43%. The troughs do not, because a
+card that was already underfilled had no second block to lose.
 
-It also costs 19 registers. Letting a block span several output tiles keeps about
-a dozen values live across the whole compute loop, and the kernel goes from v6's
-126 registers to 147. v6 had two registers of headroom, so there is no version
-that keeps both: capped at 128 for two blocks per SM it spills 76 bytes, and at
-147 with no spill it runs one block per SM. Either way the large sizes lose ~43%.
+Split-K keeps one tile per block and only parameterises the K range, so it fits
+in 128 registers with no spill. It buys less: a partial for every tile where
+Stream-K writes them only at the seams, 405 partials and 53 MB of workspace
+traffic at n=1152, against a GEMM that runs in 0.24 ms.
 
-That trade is why Stream-K wins exactly where it does. At a trough the card is
-underfilled, so dropping to one block per SM costs nothing, because there were
-never enough blocks to place two. Everywhere else it costs half the occupancy.
-
-A Split-K variant, which keeps one tile per block and only parameterises the K
-range, fits in 128 registers with no spill. It gets less: it writes a partial for
-every tile, where Stream-K only writes them at the seams. At n=1152 with S=5 that
-is 405 partials, 53 MB of workspace traffic round trip, against a GEMM that runs
-in 0.24 ms.
-
-Taking the best of the three at every size moves n=1152 from 76% to 93%, n=1280
-from 92% to 97%, n=1536 from 94% to 98%, and nothing anywhere else: only 3 of
-the 25 swept sizes have an efficiency below 75%, and past that `ceil` stops
-mattering. None of the three crosses 100%, so the count of sizes beating cuBLAS
-stays at 12 of 25. Against that, two more kernels, and a device workspace for
-the partial tiles that every caller would have to allocate, since the API takes
-pointers and nothing else. So the kernels stayed out.
-
-The projection that started this was wrong, and by a lot: dividing the current
-figure by the efficiency predicted 76% → 127% and 22 of 25 sizes. That ceiling
-assumes quantization can be removed at unchanged occupancy, and neither approach
-does both. Measured: +22.5% at the one size, and the same 12 of 25.
+Best-of-three moves n=1152 to 93%, n=1280 to 97% and n=1536 to 98%, and nothing
+else, since only those three sit below 75% efficiency. None crosses 100%, so the
+count stays at 12 of 25. Against that, two more kernels and a device workspace
+every caller would have to allocate, since the API takes pointers and nothing
+else. So neither ships.
 
 ### A second tile, chosen by the same model
 
-The model earns its keep somewhere else. Profiling cuBLAS names its kernel,
-`cutlass_80_simt_sgemm_256x128_8x4_nn_align1`, and the name is the whole
-configuration: a 256×128 block tile, 16×8 outputs per thread, 202 registers, one
-block per SM. That is the opposite of v4's choice, which spent
-`__launch_bounds__(256, 2)` to keep two blocks resident.
+Profiling cuBLAS names its kernel,
+`cutlass_80_simt_sgemm_256x128_8x4_nn_align1`, and the name gives its block tile
+and its pipeline depth: 256×128, a K-step of 8, four stages. The profile gives
+the rest: 16×8 outputs per thread, 202 registers, one block per SM. That is the
+opposite of v4's choice, which spent `__launch_bounds__(256, 2)` to keep two
+blocks resident.
 
 The reason it wins is arithmetic intensity, at two levels at once. Per k-step a
 16×8 thread reads 16 A values and 8 of B, six 128-bit shared loads, and does 128
-FMAs: 21.3 FMAs per shared load against 8×8's 16. Measured shared-load
-instructions at n=4096 drop from 134 217 728 to 100 663 296, a quarter fewer,
-which is 134/101 = 1.33 against the predicted 21.33/16 = 1.33.
+FMAs: 21.3 FMAs per shared-load instruction against 8×8's 16. Measured
+shared-load instructions at n=4096 drop from 134 217 728 to 100 663 296, the
+1.33 that ratio predicts.
 
 The same doubling of the M tile halves the global traffic, because A's panel is
 read once for twice as many output rows. Measured at n=4096:
@@ -556,11 +541,9 @@ read once for twice as many output rows. Measured at n=4096:
 | **256×128**     | **732 MB**   | **15.8%**      | **103 272 762** |
 | cuBLAS          | 534 MB       | 12.4%          | 103 280 500   |
 
-Half the DRAM traffic, and the same L2 traffic as cuBLAS to within 8 000 sectors
-out of 103 million. Note what this rules out as well: at 16 to 32% of DRAM peak
-neither kernel is bandwidth-bound, so the gap to cuBLAS is not a memory-traffic
-problem. The L2 absorbs two thirds of the panel re-reads, 4.4 GB of L2 traffic
-against 1.47 GB reaching DRAM.
+The L2 traffic matches cuBLAS to within 8 000 sectors out of 103 million, and at
+16 to 32% of DRAM peak neither kernel is bandwidth-bound, so the gap to cuBLAS
+is not a memory-traffic problem.
 
 That geometry had already been swept, and lost at 86% of cuBLAS. The sweep had
 compiled it into v5's inner loop, so it is the loop that changed, not the tile.
@@ -584,16 +567,16 @@ of the 13 sizes where both apply, without timing anything.
 | 3840 | 95%                | 95%                | 256×128 | +2.9%    |
 | 4096 | 94%                | 94%                | 256×128 | +2.5%    |
 
-It needs `M % 256 == 0`, so 13 of the 25 swept sizes can use it and the rest fall
-back. It never loses a size, and it gains one. Over the sweep:
+It needs `M % 256 == 0`, so 13 of the 25 swept sizes can use it and the rest
+fall back. Over the sweep:
 
 |                     | geometric mean | median | range      | above cuBLAS |
 |---------------------|----------------|--------|------------|--------------|
 | 128×128 alone       | 99.1%          | 98.5%  | 78.1–122.0%| 12 of 25     |
 | **with the dispatch** | **99.8%**    | 100.6% | 78.1–122.0%| **13 of 25** |
 
-At n=4096 an alternated A/B over six rounds puts the gain between +1.4% and
-+5.2%, median +2.9%.
+The size it takes across 100% is n=3840. At n=4096 an alternated A/B over six
+rounds puts the gain between +1.4% and +5.2%, median +2.9%.
 
 The geometric mean is the honest one to quote here: the arithmetic mean reads
 100.1%, which would license "beats cuBLAS on average", but that is the 122% at
@@ -604,14 +587,12 @@ for. And the domain is square aligned shapes; outside `M % 128 == 0`,
 `N % 128 == 0`, `K % 8 == 0` the wrapper falls back to the register-tiled v2 at
 around 61% of cuBLAS.
 
-Two caveats on those counts. They move by one between runs, because a handful of
-sizes sit within a point of the line and the ratio at n=1920 has swung 95% to
-113% across sessions. And the absolute GFLOP/s in the tables above predate this
-work: the machine measured ~18% low across every kernel including cuBLAS while
-this was being tuned, with the core provably healthy (a pure-FMA kernel with no
-memory access reached 97% of the card's FP32 peak in the same state). Ratios
-survive that, since cuBLAS is timed in the same run and moves with it; absolutes
-do not, so they were left alone rather than refreshed from a degraded reading.
+The counts move by one between runs, several sizes sitting within a point of the
+line. And the absolute GFLOP/s outside the quantization table were measured
+while the machine ran ~18% low, the core provably healthy at 97% of FP32 peak on
+a pure-FMA kernel in the same state. Ratios survive that since cuBLAS is timed
+in the same run; absolutes do not, so they were left rather than refreshed from
+a degraded reading.
 
 What it does not do is close the gap at n=4096, and the counters say why. With
 the bigger tile the instruction count is no longer the problem: 2.331 G
@@ -621,12 +602,12 @@ differs, 79.6% against 87.8%, and it is all in `short_scoreboard` plus `wait`:
 10.3% here against 4.5% there. Both run one block per SM, so it is not occupancy.
 
 Three attempts on that, all refuted. Double-buffering the shared loads in
-registers across the k-step changed nothing and left the register count at 206,
-which is the proof that ptxas already scheduled it that way. `cp.async` on the B
-tile cost 6.5%: it removes a fifth of the shared-store wavefronts, and triples
-`mio_throttle` from 1.5% to 4.7%, because the copy holds a queue slot for the
-whole compute phase. Deepening the pipeline to three and four stages made that
-worse, not better.
+registers across the k-step changed nothing and left the big tile's register
+count at 206, which is the proof that ptxas already scheduled it that way.
+`cp.async` on the B tile cost 6.5%: it removes a fifth of the shared-store
+wavefronts, and triples `mio_throttle` from 1.5% to 4.7%, because the copy holds
+a queue slot for the whole compute phase. Deepening the buffering to three and
+four stages made that worse, not better, though cuBLAS runs four.
 
 The reason is visible in cuBLAS's counters. It issues 25 313 280 `cp.async`
 instructions and 8 192 ordinary global loads; this kernel issues none and 8.4 M.
@@ -643,6 +624,8 @@ on v6 shows 2 `STS.128` against 8 plain `STS` per kernel, double-buffered, so
 one vectorized store per B tile and four scalar ones per A tile. B is contiguous
 on the way in and A is not, which is the same fact that stops `cp.async` from
 carrying it: the instruction copies bytes and cannot scatter them.
+
+## Inference — `gemm_bias_act_kernel` (fused bias + activation)
 
 A linear layer computes `Y = act(X·W + bias)`. Naively that is two kernels: the
 GEMM, then an element-wise pass for bias and activation, which writes the output
