@@ -29,10 +29,10 @@ basic building block of an inference layer.
   dispatched on grid size. +2–3 points at n ≥ 2048, and it unmasks the next
   bottleneck.
 - GPU v5: conflict-free Bs reads (each thread's columns split into two groups
-  half a tile apart). The ~268M bank conflicts drop to zero, measured; +8–10
-  points everywhere. 90–98% of cuBLAS at n ≥ 2048, ~116% at n=1024.
+  half a tile apart). The ~268M bank conflicts drop to zero, measured; +7 to +17
+  points depending on the size. 90–98% of cuBLAS at n ≥ 2048, ~116% at n=1024.
 - GPU v6: a warp tier between the block tile and the thread tile. Same register
-  and shared budget, a third fewer shared-memory wavefronts; +4% everywhere,
+  and shared budget, a third fewer shared-memory wavefronts; +4% on average,
   which takes the count of sizes beating cuBLAS from 5 to 12 out of 25. Ships in
   two tile geometries, 128×128 and 256×128, picked by a wave-quantization rule
   that matched the faster one on every size where both apply, without timing them.
@@ -338,10 +338,10 @@ That is v5, below.
 
 The conflict is in the Bs read, where each thread took its 8 output columns as
 one contiguous group at `threadCol * 8`: sixteen threadCols spaced 8 floats
-apart land on `(8·tc) mod 32 ∈ {0, 8, 16, 24}`, four of the 32 banks, a 4-way
-conflict on every Bs read. The count matches exactly: the kernel issues 67.1M Bs
-load instructions at n=4096 and the counter reads 268 435 456, four per
-instruction, so these are all of them and not most of them.
+apart land on `(8·tc) mod 32 ∈ {0, 8, 16, 24}`, four of the 32 banks. The count
+matches exactly: the kernel issues 67.1M Bs load instructions at n=4096 and the
+counter reads 268 435 456, four conflicts per instruction, so these are all of
+them and not most of them.
 
 The As read never conflicts, which is why the v3 transpose could not move the
 counter: `threadRow` takes only 2 values per warp, so the As read is a
@@ -378,11 +378,11 @@ what* can: v6 does exactly that and takes the same read from 4 wavefronts to 2,
 without `bank_conflicts` moving off zero. That is why the v6 gain is invisible on
 this counter, and it is the subject of the next section.
 
-Zero, not "near zero". On the bench it is the largest single step since v2:
-+8–10 points of cuBLAS at every size (v4 → v5: 79→89 at n=2048, 86→96 at
-n=3072, 80→87 at n=4096, 102→119 at n=1024), reproduced across two runs within
-±0.6 point. v4's bill is paid: the pressure that doubling the warps put on the
-LSU pipe stopped hurting once the pipe stopped replaying conflicts.
+Zero, not "near zero". On the bench it is the largest single step since v2: +10
+points of cuBLAS at n=2048 and n=3072, +7 at n=4096 and +17 at n=1024 (v4 → v5:
+79→89, 86→96, 80→87, 102→119), reproduced across two runs within ±0.6 point.
+v4's bill is paid: the pressure that doubling the warps put on the LSU pipe
+stopped hurting once the pipe stopped replaying conflicts.
 
 Two smaller facts the measurement adds. The split addressing costs 128
 registers where v3's cost 130, so v5 sits on the 2-blocks/SM cliff without
@@ -407,19 +407,20 @@ v6 gives each warp an explicit 128×16 tile, which flips the ratio: 16 distinct
 As rows and 2 distinct Bs column groups. The instruction count does not move
 (`smsp__inst_executed_op_shared_ld` is identical to the byte), but the accesses
 coalesce into a third fewer wavefronts, 402M down to 268M, or 3.0 per
-shared-load instruction down to 2.0. It is worth about 4% at every size.
+shared-load instruction down to 2.0. It is worth about 4% on average over the
+sweep.
 
 The elongated warp tile was not the prediction. A square 64×32 looked right,
 since it minimises the total distinct addresses a warp touches; it measures at
 89%, barely above v5. The count that matters is per tile, not overall, and As
 was already free.
 
-Giving As 16 distinct rows also broke it: 16 rows 8 floats apart land on 4 banks,
-a 4-way conflict, 134M of them where v5 had none. The fix is the one v5 already
-uses on Bs: read in groups of 4, the float4 the hardware serves in one pass,
-spaced across the warp tile so a warp's lanes cover a contiguous run. Applying it
-to As as well brought the counter back to zero and took the gain from ~3% to
-~5%.
+Giving As 16 distinct rows also broke it: 16 rows 8 floats apart land on 4
+banks, and the counter reports 134M conflicts where v5 had none. The fix is the
+one v5 already uses on Bs: read in groups of 4, the float4 the hardware serves
+in one pass, spaced across the warp tile so a warp's lanes cover a contiguous
+run. Applying it to As as well brought the counter back to zero and took the
+gain at n=4096 from +3% to +5%, six alternated rounds each way.
 
 | ncu, n=4096                | v5          | v6 first cut | v6          |
 |----------------------------|-------------|--------------|-------------|
@@ -945,10 +946,10 @@ tests/          correctness vs the CPU oracle (gemm, softmax, attention)
       0 spill, occupancy 17% → 33% (+2–3 points at n ≥ 2048; loses 2 on underfilled
       grids, so the wrapper dispatches on grid size)
 - [x] GEMM v5: conflict-free Bs reads (split column ownership; the ~268M conflicts
-      measured at exactly zero). +8–10 points everywhere: 90–98% of cuBLAS at
+      measured at exactly zero). +7 to +17 points depending on the size: 90–98% of cuBLAS at
       n ≥ 2048, ~116% at n=1024
 - [x] GEMM v6: warp tiling (a 128×16 warp tier; a third fewer shared-load
-      wavefronts at no register cost). +4% everywhere: 93% of cuBLAS at n=4096,
+      wavefronts at no register cost). +4% on average: 93% of cuBLAS at n=4096,
       and above it on 12 of 25 swept sizes against 5 for v5
 - [ ] GEMM v7: the remaining stalls are `barrier` (8.9%) and shared latency.
       `cp.async` is the usual answer and does not apply directly. The As tile is
