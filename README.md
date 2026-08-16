@@ -795,11 +795,13 @@ On an RTX 3080 (`sm_86`), `n×n`, full attention, device timing:
 | 2048 | ~4.4×        | ~2.1×         |
 | 4096 | ~8.4×        | ~4.0×         |
 
-Rotated inputs here too, and the rotation costs the d=64 column more than the
-d=128 one (9.2× to 8.4× at n=4096, against 3.8× to 4.0×). That asymmetry is the
-same story as the table: v2's whole advantage at d=64 is K/V reuse, so it gains
-most from a resident L2 and loses most when the inputs stop being resident. At
-d=128 it spills to local memory and the L2 is no longer what limits it.
+Rotated inputs here too, and an A/B with the buffer index as the only difference
+puts the cost at 6.4% of the d=64 speedup at n=4096 and nothing at d=128 (9.25×
+to 8.66×, against 4.45× to 4.49×). That asymmetry is the same story as the
+table: v2's whole advantage at d=64 is K/V reuse, so it gains most from a
+resident L2 and loses most when the inputs stop being resident. At d=128 the
+working set is 8 MB against a 5 MB L2, so the fixed-buffer loop was never timing
+a cache and there is nothing for the rotation to take away.
 
 The gain grows with n: the longer the sequence, the more each cached `K`/`V`
 tile is reused. d=128 gains less than d=64 because of the register spill. Since
