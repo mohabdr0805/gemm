@@ -232,7 +232,7 @@ raise arithmetic intensity, which is worth more than occupancy at this point.
 | v3     | 130 (0 spill)    | 16384 B      | 17% (1 block/SM)   | 15 451           |
 | v4     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 15 797           |
 | v5     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 17 926           |
-| v6     | 126 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 18 472           |
+| v6     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 18 472           |
 
 Occupancy falls 100% → 33% → 17% down the first three rows while throughput
 rises 1 420 → 12 052 → 15 451. v1 sits at 100% theoretical occupancy yet runs
@@ -445,9 +445,10 @@ v6 gain is wavefronts per instruction and not instructions. It also confirms a
 claim made earlier from `ptxas` behaviour alone: the shared reads are fused into
 128-bit loads.
 
-It costs nothing to get there: 126 registers against v5's 128, the same 16 KB of
-shared, the same 33% occupancy. The warp tier hands two registers back rather
-than taking any.
+It costs nothing to get there: the same 128 registers as v5, the same 16 KB of
+shared, the same 33% occupancy. That 128 is a ceiling rather than a round
+number: 65 536 registers per SM over 512 threads is exactly 128 each, so one
+more would drop v6 to one block per SM the way v3's 130 does.
 
 Nsight Compute reports v6 and v5 within 0.3% of each other where the benchmark
 shows 5%: it profiles one launch in isolation, at base clocks, with caches
