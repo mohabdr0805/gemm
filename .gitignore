@@ -29,4 +29,7 @@ Thumbs.db
 # install, so it is not portable. The portable recipe is the cmake invocation
 # documented in the README.
 build.bat
-"__pycache__/" 
+
+# Python bytecode from the benchmark scripts
+__pycache__/
+
