@@ -22,7 +22,7 @@ basic building block of an inference layer.
 - GPU v1: shared-memory tiled kernel (coalesced loads, bank-conflict padding,
   border handling).
 - GPU v2: register tiling, each thread computing an 8×8 micro-block of C.
-  6–8.3× over v1 (grows with size), ~61–63% of cuBLAS SGEMM on the same card.
+  6–8.5× over v1 (grows with size), ~61–63% of cuBLAS SGEMM on the same card.
 - GPU v3: v2 + vectorized `float4` loads and double buffering, each step chosen
   from a Nsight Compute profile. 76–83% of cuBLAS at n ≥ 2048, ~104% at n=1024.
 - GPU v4: the same kernel pinned at 128 registers with `__launch_bounds__`,
@@ -176,7 +176,7 @@ quantize the same way. Ours is nearly flat, 16.7–19.4 TFLOP/s over the 25
 shapes; cuBLAS covers 13.7 to 21.0, swinging with which of its kernels each
 shape selects, six different ones across the sweep. Our biggest losses are
 against its 256×128 tile. One size is genuinely bad on our side: n=1152 sits at
-76%, its 81 blocks leaving the card 60% filled whichever `__launch_bounds__`
+78%, its 81 blocks leaving the card 60% filled whichever `__launch_bounds__`
 build runs. `ctest` checks every kernel, cuBLAS included, against the CPU oracle
 (max error ~1e-5, tolerance 1e-3). The benchmark does not check correctness.
 
@@ -486,7 +486,7 @@ SMs means every SM gets at most one, so the card is never loaded two blocks deep
 which is what the formula assumes. Naming that limit is worth more than adding a
 parameter to hide it.
 
-So n=1152 at 76% of cuBLAS is not an inefficient kernel. It is 1.19 blocks per
+So n=1152 at 78% of cuBLAS is not an inefficient kernel. It is 1.19 blocks per
 SM paid at the price of 2. Its Nsight profile agrees: the FMA pipe drops to 68%
 and active warps to 21%, but `long_scoreboard` sits at 0.09% and `not_selected`
 at 49%, which says the scheduler has more eligible warps than issue slots, so no
@@ -500,7 +500,7 @@ slice may start mid-tile and end mid-tile. Partial tiles go to a workspace and a
 second kernel recombines them. Implemented here and validated against cuBLAS on
 11 shapes, including a single tile split across 128 blocks.
 
-It buys the troughs: n=1152 goes from 76% of cuBLAS to 93%. It costs 19
+It buys the troughs: n=1152 goes from 78% of cuBLAS to 93%. It costs 19
 registers, because a block spanning several output tiles keeps about a dozen
 values live across the whole compute loop, and v6 had two of headroom. Capped at
 128 for two blocks per SM it spills 76 bytes; at 147 with no spill it runs one
