@@ -193,8 +193,8 @@ global loads into registers up front (in flight while the current tile is
 computed), then lands them in the other buffer and swaps, so the latency
 overlaps the FMAs instead of stalling in front of them. The prediction was that
 `long_scoreboard` would collapse and large-n throughput would recover, and both
-held: the stall fell from ~16% to ~2%, and v3 reaches 76–83% of cuBLAS at
-n ≥ 2048 (77% at n=4096, 76% at n=2048, 83% at n=3072). At n=1024 it passes
+held: the stall fell from ~16% to ~2%, and v3 reaches 77–83% of cuBLAS at
+n ≥ 2048 (77% at n=2048 and n=4096, 83% at n=3072). At n=1024 it passes
 cuBLAS outright, ~104%, for the occupancy reason given above: one block per
 SM needs only 64 of the card's 68 slots to fill it.
 
@@ -289,9 +289,9 @@ what* can: v6 does exactly that and takes the same read from 4 wavefronts to 2,
 without `bank_conflicts` moving off zero. That is why the v6 gain is invisible on
 this counter, and it is the subject of the next section.
 
-Zero, not "near zero". On the bench it is the largest single step since v2: +10
-points of cuBLAS at n=2048 and n=3072, +7 at n=4096 and +17 at n=1024 (v4 → v5:
-79→89, 86→96, 80→87, 102→119), reproduced across two runs within ±0.6 point.
+Zero, not "near zero". On the bench it is the largest single step since v2: +12
+points of cuBLAS at n=2048 and n=3072, +11 at n=4096 and +13 at n=1024 (v4 → v5:
+79→91, 86→98, 79→90, 103→116).
 v4's bill is paid: the pressure that doubling the warps put on the LSU pipe
 stopped hurting once the pipe stopped replaying conflicts.
 

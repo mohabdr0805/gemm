@@ -12,7 +12,7 @@ not a median of N runs; reproducibility was checked by hand (two independent run
 of the full suite agreed within 0.5 point on every ratio and 0.4% on absolute
 GFLOP/s), not enforced by the harness.
 
-The lock is not decoration; both halves of it were bought with a mistake. This
+The lock is not decoration; both halves of it were bought with a mistake. The
 README's first numbers came from a session where the card was silently stuck in a
 low memory P-state: cuBLAS measured 9.6 TFLOP/s, 32% of the card's FP32 peak,
 a number no vendor SGEMM produces on healthy hardware, and that is the sanity check
