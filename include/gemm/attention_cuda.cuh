@@ -42,6 +42,14 @@ void flash_attention_cuda_fa2(int M, int N, int d, float scale,
                               const float* Q, const float* K, const float* V,
                               float* O, bool causal);
 
+// v3: register micro-tiling. A thread owns a 4x4 block of the score tile and a
+// 4 x d/8 block of the output, so the accumulators are independent and the
+// exponential stays at one per (row, key). d in {32, 64, 128} only. Same result
+// as v1/v2/FA-2.
+void flash_attention_cuda_v3(int M, int N, int d, float scale,
+                             const float* Q, const float* K, const float* V,
+                             float* O, bool causal);
+
 // Device-timed v1 vs v2 (no transfers): the pure kernel speedup from query
 // tiling. Use a head dim d in {32, 64, 128} so v2 runs its specialized kernel.
 void benchmark_attention_versions(int M, int N, int d, bool causal);

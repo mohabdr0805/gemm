@@ -69,6 +69,12 @@ Each kernel in detail is in [`docs/attention.md`](docs/attention.md).
 - **FA-2-style**: the head dimension split across a warp. It removes v2's
   register spill at d=128 and runs 1.6–6.2× over v2 there, while at d=64 and
   long sequences v2 stays ahead.
+- **v3**: a register micro-tile per thread, so the exponential stays at one per
+  (row, key). 1.25× to 2.99× over the best of the three above.
+
+Against PyTorch on the same buffers, v3 beats its FP32 path, which materializes
+the N×N matrix, on 5 of 8 shapes, and runs 2.2× to 5.5× behind cuDNN's FP16
+kernel on tensor cores.
 
 ## Also in the repo
 
@@ -99,7 +105,6 @@ the register-tiled v2 at around 61% of cuBLAS.
 - A v7 for the remaining `barrier` and shared-latency stalls.
 - The fused epilogue on the register-tiled kernel, which currently sits on v1's
   tiling.
-- A PyTorch SDPA baseline for the attention kernels.
 
 ## Build & run
 
@@ -124,6 +129,12 @@ ctest --test-dir build --output-on-failure
 ```
 Default target architectures are `75;86` (Turing + Ampere); pass
 `-DCMAKE_CUDA_ARCHITECTURES=89` (Ada, etc.) to target your own card.
+
+The attention baseline also needs PyTorch with CUDA, and loads the `gemm_capi`
+library the CUDA build produces:
+```bash
+python benchmarks/attention_baseline.py
+```
 
 ## Docker
 
@@ -155,7 +166,8 @@ include/gemm/   headers (gemm_cpu.hpp, gemm_cuda.cuh, activation.hpp,
                 softmax*.hpp/cuh, attention*.hpp/cuh)
 src/            gemm_cpu.cpp (naive + tiled), gemm_cuda.cu (kernels),
                 softmax_{cpu,cuda}, attention_{cpu,cuda}
-benchmarks/     GFLOP/s, v1/v2/v3 vs cuBLAS, fusion, softmax, attention benchmarks
+benchmarks/     GFLOP/s, v1/v2/v3 vs cuBLAS, fusion, softmax, attention benchmarks;
+                attention_baseline.py, the attention kernels against PyTorch
 tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 docs/           the detailed write-up: methodology, GEMM steps, wave
                 quantization, attention

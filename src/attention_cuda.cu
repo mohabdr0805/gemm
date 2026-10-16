@@ -530,3 +530,338 @@ void benchmark_attention_fa2(int M, int N, int d, bool causal) {
 }
 
 } // namespace gemm
+
+// ---------------------------------------------------------------------------
+// v3: register micro-tiling -- the v1 -> v2 move of the GEMM, carried over
+// ---------------------------------------------------------------------------
+//
+// What the profiler said about the two kernels above, and why this exists.
+//
+//   v2, one thread per query row: 67.7 % of its SASS is FFMA, which is a good
+//   mix, but its parallelism is exactly M threads. At M=4096 that is 0.24 waves
+//   per SM, two active warps, 80 % of cycles with nothing eligible. Handing it a
+//   full grid lifts it from 4.2 % to 14.1 % of peak and no further, because two
+//   things still cap it: 218 registers per thread, so four blocks of two warps
+//   per SM, and a dependent FFMA chain of length D inside the score loop that
+//   float semantics forbid ptxas from splitting.
+//
+//   fa2, one warp per row: fills the machine and issues at half the peak rate,
+//   yet only 12.4 % of its instructions are FFMA. Splitting a row across 32
+//   lanes divides the multiply-adds by 32 and not the exponentials -- after the
+//   shuffle reduction all 32 lanes hold the same score and every one of them
+//   calls expf, so the FMA-to-exp ratio falls from 128:1 to 4:1.
+//
+// The two are equally far from peak for opposite reasons, and neither is fixed
+// by sliding along that cursor. This kernel takes the middle: a thread owns a
+// TM x TN block of the score tile and a TM x TD block of the output, so
+//
+//   * the accumulators are independent -- 16 scores and 32 outputs in flight --
+//     which is instruction-level parallelism standing in for the occupancy v2
+//     cannot have, the same argument as v2/v3 on the GEMM side of this repo;
+//   * every shared value loaded feeds TM or TN multiply-adds instead of one;
+//   * the exponential stays at one per (row, key), keeping v2's 128:1 ratio
+//     rather than fa2's 4:1.
+//
+// Per K/V tile: score micro-tile GEMM into registers, scores to shared, row max
+// and row sum, rescale, output micro-tile GEMM. The score buffer aliases the K
+// buffer, dead by that point, to stay inside the shared budget.
+#define ATTN3_BR      64   // query rows per block
+#define ATTN3_BC      32   // keys per streamed tile
+#define ATTN3_THREADS 128  // 4 warps, one per scheduler
+
+namespace {
+
+// Laid out by hand: the tile sizes depend on D, static __shared__ caps at 48 KB,
+// and D=128 needs more than that.
+struct V3Shared {
+    float* Qs;   // [BR][D+1]  loaded once per block
+    float* Vs;   // [BC][D+1]  per tile
+    float* KP;   // [BC][D+1] as K, then [BR][BC+1] as P
+    float* mrow; // [BR] running max
+    float* lrow; // [BR] running normaliser
+    float* crow; // [BR] this tile's rescale factor
+};
+
+__device__ __host__ inline int v3_kp_floats(int D) {
+    const int as_k = ATTN3_BC * (D + 1);
+    const int as_p = ATTN3_BR * (ATTN3_BC + 1);
+    return as_k > as_p ? as_k : as_p;
+}
+
+__device__ inline V3Shared v3_layout(float* raw, int D) {
+    V3Shared s;
+    s.Qs = raw;
+    s.Vs = s.Qs + (size_t)ATTN3_BR * (D + 1);
+    s.KP = s.Vs + (size_t)ATTN3_BC * (D + 1);
+    s.mrow = s.KP + v3_kp_floats(D);
+    s.lrow = s.mrow + ATTN3_BR;
+    s.crow = s.lrow + ATTN3_BR;
+    return s;
+}
+
+inline size_t v3_shared_bytes(int D) {
+    return sizeof(float) * ((size_t)ATTN3_BR * (D + 1) + (size_t)ATTN3_BC * (D + 1)
+                            + (size_t)v3_kp_floats(D) + 3 * ATTN3_BR);
+}
+
+} // namespace
+
+namespace gemm {
+
+template <int D>
+__global__ void flash_attention_v3_kernel(int M, int N, float scale,
+                                          const float* __restrict__ Q,
+                                          const float* __restrict__ K,
+                                          const float* __restrict__ V,
+                                          float* __restrict__ O, bool causal) {
+    constexpr int BR = ATTN3_BR, BC = ATTN3_BC, NT = ATTN3_THREADS;
+    constexpr int TM = 4, TN = 4;          // score micro-tile, 16 per thread
+    constexpr int RG = BR / TM;            // 16 row groups
+    constexpr int CG = BC / TN;            // 8 key groups, RG * CG == NT
+    constexpr int DG = NT / RG;            // 8 column groups for the output
+    constexpr int TD = D / DG;             // output micro-tile, TM x TD
+
+    extern __shared__ float raw[];
+    V3Shared sh = v3_layout(raw, D);
+
+    const int tid = threadIdx.x;
+    const int row0 = blockIdx.x * BR;
+
+    const int sr = tid / CG, sc = tid % CG;   // scores: rows sr*TM.., keys sc*TN..
+    const int orow = tid / DG, ocol = tid % DG;
+
+    // Q into shared once: every key tile re-reads it, and during the score GEMM
+    // a thread needs rows it does not own.
+    for (int idx = tid; idx < BR * D; idx += NT) {
+        const int r = idx / D, t = idx % D;
+        sh.Qs[r * (D + 1) + t] = (row0 + r < M) ? Q[(size_t)(row0 + r) * D + t] : 0.0f;
+    }
+    for (int r = tid; r < BR; r += NT) { sh.mrow[r] = -FLT_MAX; sh.lrow[r] = 0.0f; }
+
+    float acc[TM][TD];
+    #pragma unroll
+    for (int m = 0; m < TM; ++m)
+        #pragma unroll
+        for (int t = 0; t < TD; ++t) acc[m][t] = 0.0f;
+    __syncthreads();
+
+    const int nkeys_block = causal ? min(N, min(row0 + BR, M)) : N;
+
+    for (int j0 = 0; j0 < nkeys_block; j0 += BC) {
+        const int tile = min(BC, N - j0);
+
+        for (int idx = tid; idx < BC * D; idx += NT) {
+            const int c = idx / D, t = idx % D;
+            const bool ok = (c < tile);
+            sh.KP[c * (D + 1) + t] = ok ? K[(size_t)(j0 + c) * D + t] : 0.0f;
+            sh.Vs[c * (D + 1) + t] = ok ? V[(size_t)(j0 + c) * D + t] : 0.0f;
+        }
+        __syncthreads();
+
+        float s[TM][TN];
+        #pragma unroll
+        for (int m = 0; m < TM; ++m)
+            #pragma unroll
+            for (int n = 0; n < TN; ++n) s[m][n] = 0.0f;
+
+        for (int t = 0; t < D; ++t) {
+            float a[TM], b[TN];
+            #pragma unroll
+            for (int m = 0; m < TM; ++m) a[m] = sh.Qs[(sr * TM + m) * (D + 1) + t];
+            #pragma unroll
+            for (int n = 0; n < TN; ++n) b[n] = sh.KP[(sc * TN + n) * (D + 1) + t];
+            #pragma unroll
+            for (int m = 0; m < TM; ++m)
+                #pragma unroll
+                for (int n = 0; n < TN; ++n) s[m][n] += a[m] * b[n];
+        }
+        __syncthreads();   // K is dead here; the buffer becomes P
+
+        #pragma unroll
+        for (int m = 0; m < TM; ++m) {
+            const int r = sr * TM + m, gi = row0 + r;
+            #pragma unroll
+            for (int n = 0; n < TN; ++n) {
+                const int c = sc * TN + n, gj = j0 + c;
+                const bool live = (c < tile) && (gi < M) && (!causal || gj <= gi);
+                sh.KP[r * (BC + 1) + c] = live ? scale * s[m][n] : -FLT_MAX;
+            }
+        }
+        __syncthreads();
+
+        // Row max, rescale, exp, row sum. SUB threads per row, reduced over
+        // adjacent lanes. The exponential is evaluated once per (row, key) --
+        // the ratio fa2 gives up.
+        {
+            constexpr int SUB = NT / BR;
+            constexpr int PER = BC / SUB;
+            const int r = tid / SUB, sub = tid % SUB;
+            float local = -FLT_MAX;
+            #pragma unroll
+            for (int c = 0; c < PER; ++c)
+                local = fmaxf(local, sh.KP[r * (BC + 1) + sub * PER + c]);
+            #pragma unroll
+            for (int step = 1; step < SUB; step <<= 1)
+                local = fmaxf(local, __shfl_xor_sync(0xffffffff, local, step));
+
+            const float m_old = sh.mrow[r];
+            const float m_new = fmaxf(m_old, local);
+            const float corr = (m_old == -FLT_MAX) ? 0.0f : expf(m_old - m_new);
+
+            float sum = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < PER; ++c) {
+                const int off = r * (BC + 1) + sub * PER + c;
+                const float sv = sh.KP[off];
+                const float p = (sv == -FLT_MAX) ? 0.0f : expf(sv - m_new);
+                sh.KP[off] = p;
+                sum += p;
+            }
+            #pragma unroll
+            for (int step = 1; step < SUB; step <<= 1)
+                sum += __shfl_xor_sync(0xffffffff, sum, step);
+
+            if (sub == 0) {
+                sh.mrow[r] = m_new;
+                sh.lrow[r] = sh.lrow[r] * corr + sum;
+                sh.crow[r] = corr;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int m = 0; m < TM; ++m) {
+            const float corr = sh.crow[orow * TM + m];
+            #pragma unroll
+            for (int t = 0; t < TD; ++t) acc[m][t] *= corr;
+        }
+        for (int c = 0; c < BC; ++c) {
+            float p[TM], v[TD];
+            #pragma unroll
+            for (int m = 0; m < TM; ++m) p[m] = sh.KP[(orow * TM + m) * (BC + 1) + c];
+            #pragma unroll
+            for (int t = 0; t < TD; ++t) v[t] = sh.Vs[c * (D + 1) + ocol * TD + t];
+            #pragma unroll
+            for (int m = 0; m < TM; ++m)
+                #pragma unroll
+                for (int t = 0; t < TD; ++t) acc[m][t] += p[m] * v[t];
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int m = 0; m < TM; ++m) {
+        const int r = orow * TM + m, gi = row0 + r;
+        if (gi >= M) continue;
+        const float l = sh.lrow[r];
+        const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+        #pragma unroll
+        for (int t = 0; t < TD; ++t) O[(size_t)gi * D + ocol * TD + t] = acc[m][t] * inv;
+    }
+}
+
+static void launch_v3(int M, int N, int d, float scale, const float* Q, const float* K,
+                      const float* V, float* O, bool causal) {
+    dim3 block(ATTN3_THREADS), grid((M + ATTN3_BR - 1) / ATTN3_BR);
+    const size_t smem = v3_shared_bytes(d);
+    if (d == 32) {
+        cudaFuncSetAttribute(flash_attention_v3_kernel<32>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        flash_attention_v3_kernel<32><<<grid, block, smem>>>(M, N, scale, Q, K, V, O, causal);
+    } else if (d == 64) {
+        cudaFuncSetAttribute(flash_attention_v3_kernel<64>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        flash_attention_v3_kernel<64><<<grid, block, smem>>>(M, N, scale, Q, K, V, O, causal);
+    } else {
+        cudaFuncSetAttribute(flash_attention_v3_kernel<128>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        flash_attention_v3_kernel<128><<<grid, block, smem>>>(M, N, scale, Q, K, V, O, causal);
+    }
+}
+
+void flash_attention_cuda_v3(int M, int N, int d, float scale,
+                             const float* Q, const float* K, const float* V,
+                             float* O, bool causal) {
+    if (M <= 0 || N <= 0 || d <= 0) return;
+    const size_t sq  = (size_t)M * d * sizeof(float);
+    const size_t skv = (size_t)N * d * sizeof(float);
+
+    float *dQ, *dK, *dV, *dO;
+    CUDA_CHECK(cudaMalloc(&dQ, sq));
+    CUDA_CHECK(cudaMalloc(&dK, skv));
+    CUDA_CHECK(cudaMalloc(&dV, skv));
+    CUDA_CHECK(cudaMalloc(&dO, sq));
+    CUDA_CHECK(cudaMemcpy(dQ, Q, sq,  cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dK, K, skv, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV, V, skv, cudaMemcpyHostToDevice));
+
+    launch_v3(M, N, d, scale, dQ, dK, dV, dO, causal);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(O, dO, sq, cudaMemcpyDeviceToHost));
+    cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
+}
+
+} // namespace gemm
+
+// --- C entry points, device pointers, no allocation and no transfer ----------
+//
+// The public flash_attention_cuda* functions above own their memory: they
+// cudaMalloc, copy the inputs in, launch, and copy back. That is the right shape
+// for a caller that has host data, and the wrong shape for a benchmark -- timing
+// them would time three allocations and four transfers around the kernel.
+// benchmark_attention_versions avoids that by launching the kernels directly on
+// buffers it allocated once, which is what these wrappers expose.
+//
+// They exist so a Python process can time these kernels against another
+// library's on the SAME buffers in the SAME process, which is the only way two
+// numbers are comparable here.
+#if defined(_WIN32)
+#  define GEMM_API extern "C" __declspec(dllexport)
+#else
+#  define GEMM_API extern "C" __attribute__((visibility("default")))
+#endif
+
+GEMM_API void gemm_attn_v1(int M, int N, int d, float scale, const float* Q,
+                           const float* K, const float* V, float* O, int causal) {
+    gemm::flash_attention_kernel<<<M, ATTN_THREADS>>>(M, N, d, scale, Q, K, V, O, causal != 0);
+}
+
+GEMM_API void gemm_attn_v2(int M, int N, int d, float scale, const float* Q,
+                           const float* K, const float* V, float* O, int causal) {
+    dim3 b(ATTN2_BR), g((M + ATTN2_BR - 1) / ATTN2_BR);
+    gemm::launch_v2(g, b, M, N, d, scale, Q, K, V, O, causal != 0);
+}
+
+GEMM_API void gemm_attn_fa2(int M, int N, int d, float scale, const float* Q,
+                            const float* K, const float* V, float* O, int causal) {
+    dim3 b(32 * ATTN_FA2_WPB), g((M + ATTN_FA2_WPB - 1) / ATTN_FA2_WPB);
+    gemm::launch_fa2(g, b, M, N, d, scale, Q, K, V, O, causal != 0);
+}
+
+GEMM_API void gemm_attn_v3(int M, int N, int d, float scale, const float* Q,
+                           const float* K, const float* V, float* O, int causal) {
+    gemm::launch_v3(M, N, d, scale, Q, K, V, O, causal != 0);
+}
+
+GEMM_API int gemm_attn_last_error(void) { return (int)cudaGetLastError(); }
+GEMM_API int gemm_attn_sync(void) { return (int)cudaDeviceSynchronize(); }
+
+GEMM_API int gemm_attn_l2_bytes(void) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    cudaDeviceProp p;
+    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 0;
+    return p.l2CacheSize;
+}
+
+// Grid/block actually launched, so the harness can report occupancy rather than
+// assume it. Returns blocks; *threads gets the block size.
+GEMM_API int gemm_attn_launch_shape(int which, int M, int* threads) {
+    if (which == 1) { *threads = ATTN_THREADS; return M; }
+    if (which == 2) { *threads = ATTN2_BR; return (M + ATTN2_BR - 1) / ATTN2_BR; }
+    if (which == 3) { *threads = ATTN3_THREADS; return (M + ATTN3_BR - 1) / ATTN3_BR; }
+    *threads = 32 * ATTN_FA2_WPB;
+    return (M + ATTN_FA2_WPB - 1) / ATTN_FA2_WPB;
+}

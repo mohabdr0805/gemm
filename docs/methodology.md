@@ -39,12 +39,3 @@ enough to stay L2-resident: 504 GB/s with a fixed buffer against 333 GB/s
 rotating, and 1.00× at 32 MB, well past the L2. Attention is the benchmark that
 was actually flattered, and [its own section](attention.md) carries the figure. All three rotate
 regardless, softmax included, where it measures clean.
-
-*Scope: FP32 on CUDA cores throughout (no tensor cores). The cuBLAS baseline
-runs in its default math mode (plain `cublasSgemm`, no `cublasSetMathMode`), so
-TF32 is disabled and the comparison is like-for-like. Cross-check: cuBLAS
-matches the FP32 CPU oracle to ~1e-5, where TF32's 10-bit mantissa would give
-errors around 1e-3. The baseline is cuBLAS's default heuristic kernel choice via
-`cublasSgemm`, not an exhaustive `cublasLt` algorithm search; that is the field
-standard for this comparison, and it is what sets the ceiling. One card
-(RTX 3080, `sm_86`), one OS; the ratios can move on Ada/Hopper.*

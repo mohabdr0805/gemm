@@ -71,6 +71,12 @@ if(USE_CUDA)
   # PRIVATE is enough: CMake still adds cublas to the final link of consumers
   # of this static library; no cuBLAS type appears in our public headers.
   target_link_libraries(gemm_cuda PRIVATE CUDA::cublas)
+
+  # Shared library exposing the attention kernels through a C ABI, so a Python
+  # process can call them on tensors it allocated itself. Only needed by the
+  # attention baseline harness; nothing else links it.
+  add_library(gemm_capi SHARED src/attention_cuda.cu)
+  target_include_directories(gemm_capi PRIVATE include)
 endif()
 
 # --- Benchmark ---------------------------------------------------------------

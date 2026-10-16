@@ -37,16 +37,9 @@ crossover sits at n\* ≈ 5 MB / (408 × 4 B) ≈ 3 200. Below it, every re-read
 L2 hit and both kernels pay only the incompressible 2·M·N of DRAM traffic (the
 first read of `x`, the write of `y`), so they are indistinguishable and the 5/3
 model predicts a gain that does not exist. Above it the model becomes exact.
-
-Two things this cost. The first draft folded the 256 partials on **one** thread
-instead of a tree: correct, 40% less traffic, and *slower than the 3-pass*
-(0.71× at 2048², 0.41× at 2048×1024). The serial fold is 255 of the ~271
-sequential steps on a block's critical path, ~94%, and it does not shrink with n,
-so halving n makes the penalty worse. And the benchmark itself used to sample only
-`(n, n)` and `(n, 1024)`, both below n\* at the usual n, which made a 1.69× kernel
-read as 0.98× and nearly got it written off. Less algorithmic traffic only becomes
-speed if the traffic you removed was not already being served by cache; it is also
-why attention, which never fits, wins unconditionally.
+Less algorithmic traffic only becomes speed if the traffic you removed was not
+already being served by cache; it is also why attention, which never fits, wins
+unconditionally.
 
 ## FlashAttention v1 — `flash_attention_kernel`
 
@@ -105,8 +98,7 @@ scheduling slots, and at 17% occupancy those eight resident warps are what would
 otherwise hide the re-read above.
 
 Neither is worth fixing in v1, and both are gone by FA-2 (shared templated on
-`d`, one row per warp). They are recorded because the re-read is only part of
-the answer.
+`d`, one row per warp).
 
 ## Attention v2 — query tiling (`flash_attention_v2_kernel`)
 
@@ -154,9 +146,6 @@ this is a single head, the benchmark only exposes `M/BR` blocks, so at small n
 the crossover is around n = 1024. A real workload adds batch·heads more blocks
 and v2 wins across the board.
 
-`./build/bench n` prints v1 vs v2 for both table dims (d = 64 and d = 128),
-full and causal.
-
 ## Attention FA-2 — warp-partitioned head dim (`flash_attention_fa2_kernel`)
 
 v2 gives a query row to one thread, which holds `q[d]` and `acc[d]` in registers.
@@ -194,5 +183,41 @@ a row to a warp, so a block serves only 8 rows against v2's 64, and each shared
 K/V tile is reused 8× per block instead of 64×. At large n the K/V traffic
 dominates, so v2's higher reuse wins (0.74× at n=4096); at small n v2 is
 block-starved (16 blocks for 68 SMs, wave quantization) while FA-2's smaller row
-tile fills the card, so FA-2 wins. The right kernel depends on the regime: FA-2
+tile fills the card, so FA-2 wins. Between these two, the right kernel depends on
+the regime: FA-2
 for d=128, v2 for d≤64 at long sequence length.
+
+## Attention v3 — register micro-tiling (`flash_attention_v3_kernel`)
+
+v2 and FA-2 both sit at 0.27 FFMA per cycle out of 4, for opposite reasons: v2
+has the right instruction mix and too few warps, FA-2 fills the card but spends
+most of its slots on the butterfly and on an exponential every lane recomputes.
+Nsight Compute at d=64, n=4096:
+
+| d=64, n=4096           | v2    | FA-2  |
+|------------------------|-------|-------|
+| waves per SM           | 0.24  | 1.88  |
+| achieved occupancy     | 4.2%  | 62%   |
+| executed IPC (max 4)   | 0.40  | 2.14  |
+| FFMA share of the SASS | 67.7% | 12.4% |
+
+v3 gives each thread a 4×4 block of distinct (row, key) pairs, so the dot
+product stays inside the thread and each exponential is computed once.
+
+Against PyTorch on the same buffers, in one process
+(`benchmarks/attention_baseline.py`, clocks locked, ms per call):
+
+| n    | d   | causal | v2    | FA-2  | **v3**    | math FP32 | cuDNN FP16 |
+|------|-----|--------|-------|-------|-----------|-----------|------------|
+| 1024 | 64  | no     | 0.616 | 0.258 | **0.207** | 0.243     | 0.091      |
+| 1024 | 64  | yes    | 0.615 | 0.258 | **0.206** | 0.333     | 0.095      |
+| 2048 | 64  | no     | 1.205 | 0.832 | **0.408** | 0.266     | 0.176      |
+| 2048 | 64  | yes    | 1.202 | 0.611 | **0.405** | 0.420     | 0.182      |
+| 4096 | 64  | no     | 2.444 | 3.303 | **0.818** | 0.904     | 0.347      |
+| 4096 | 64  | yes    | 2.407 | 2.011 | **0.808** | 1.480     | 0.359      |
+| 4096 | 128 | no     | 8.986 | 5.486 | **1.874** | 1.118     | 0.343      |
+| 4096 | 128 | yes    | 8.936 | 2.954 | **1.848** | 1.692     | 0.342      |
+
+v3 is 1.25× to 2.99× faster than the faster of v2 and FA-2, beats the FP32 math
+path on 5 of the 8 shapes, and runs 2.2× to 5.5× behind cuDNN's FP16 kernel on
+tensor cores.

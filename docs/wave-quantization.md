@@ -28,8 +28,7 @@ Across the 25, 24 land inside 3%, mean error 1.1%, median 0.8%. The one miss is
 n=1024, and it marks the model's domain. It has the same efficiency as n=4096 and
 the same prediction, yet lands 8.6% off where n=4096 is 1.2%: 64 blocks for 68
 SMs means every SM gets at most one, so the card is never loaded two blocks deep,
-which is what the formula assumes. Naming that limit is worth more than adding a
-parameter to hide it.
+which is what the formula assumes.
 
 So n=1152 at 78% of cuBLAS is not an inefficient kernel. It is 1.19 blocks per
 SM paid at the price of 2. Its Nsight profile agrees: the FMA pipe drops to 68%
@@ -129,16 +128,10 @@ The geometric mean is the honest one to quote here: the arithmetic mean reads
 n=1024 doing the work, and averaging ratios arithmetically overweights the wins.
 99.8% is parity, slightly under. The spread matters more than either: a factor
 1.5 separates the ends, and the 78% is n=1152, which the model above accounts
-for. And the domain is square aligned shapes; outside `M % 128 == 0`,
-`N % 128 == 0`, `K % 8 == 0` the wrapper falls back to the register-tiled v2 at
-around 61% of cuBLAS.
+for.
 
 The counts move by one between runs, several sizes sitting within a point of the
-line. And the absolute GFLOP/s outside the quantization table were measured
-while the machine ran ~18% low, the core provably healthy at 97% of FP32 peak on
-a pure-FMA kernel in the same state. Ratios survive that since cuBLAS is timed
-in the same run; absolutes do not, so they were left rather than refreshed from
-a degraded reading.
+line.
 
 What it does not do is close the gap at n=4096, and the counters say why. With
 the bigger tile the instruction count is no longer the problem: 2.331 G

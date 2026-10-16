@@ -156,6 +156,19 @@ int main() {
         run_case(gemm::flash_attention_cuda_fa2, "f2", 130,  64, 128, true);  // M > N causal
         run_case(gemm::flash_attention_cuda_fa2, "f2",  64,   1,  64, false); // single key
         run_case(gemm::flash_attention_cuda_fa2, "f2",  70,  90,  48, true);  // odd d -> v2 fallback
+
+        // v3 (register micro-tiling): each dim is a distinct template instantiation;
+        // M not a multiple of the row tile (ATTN3_BR=64), N not a multiple of the
+        // key tile (32), M > N causal, single key. No odd d: v3 has no fallback.
+        run_case(gemm::flash_attention_cuda_v3, "v3", 100, 100,  32, false);
+        run_case(gemm::flash_attention_cuda_v3, "v3", 100, 100,  32, true);
+        run_case(gemm::flash_attention_cuda_v3, "v3", 200, 200,  64, false);
+        run_case(gemm::flash_attention_cuda_v3, "v3", 200, 200,  64, true);
+        run_case(gemm::flash_attention_cuda_v3, "v3", 150, 100,  64, true);  // M > N, M % 64 != 0
+        run_case(gemm::flash_attention_cuda_v3, "v3", 130, 130, 128, false);
+        run_case(gemm::flash_attention_cuda_v3, "v3", 130, 130, 128, true);
+        run_case(gemm::flash_attention_cuda_v3, "v3", 130,  64, 128, true);  // M > N causal
+        run_case(gemm::flash_attention_cuda_v3, "v3",  64,   1,  64, false); // single key
     }
 #endif
 
