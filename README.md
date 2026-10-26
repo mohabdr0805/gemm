@@ -2,13 +2,13 @@
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
-> **TL;DR**: hand-written CUDA SGEMM at **99.8% of cuBLAS SGEMM** on the
+> **TL;DR**: hand-written CUDA SGEMM at **102.4% of cuBLAS SGEMM** on the
 > geometric mean of 25 square aligned sizes from n=1024 to 4096, ahead of it on
-> 13 of them, spread 78% to 122%. The low end is wave quantization, modelled
+> 15 of them, spread 86% to 124%. The low end is wave quantization, modelled
 > below. Plus a FlashAttention-style attention kernel, up to ~8.4× from query
 > tiling. Every step was chosen from a Nsight Compute profile, every kernel is
-> checked against a CPU oracle, and device figures come from an RTX 3080 with
-> locked clocks, ~200 ms of work per kernel, cuBLAS timed in the same run.
+> checked against a CPU oracle, and device figures come from an RTX 3080, ~200 ms
+> of work per kernel, cuBLAS timed in the same run.
 
 Optimized GEMM (`C = α·A·B + β·C`) in C++/OpenMP and CUDA, single precision,
 row-major. The repo goes from a naive reference to tuned CPU and GPU kernels and
@@ -31,16 +31,21 @@ of cuBLAS SGEMM:
 Four sizes are the round numbers everyone quotes, and they hide how much the
 ratio moves with shape. Over all 25 sizes, in steps of 128:
 
-| geometric mean | median | range       | above cuBLAS |
-|----------------|--------|-------------|--------------|
-| **99.8%**      | 100.6% | 78.1–122.0% | **13 of 25** |
+|                                     | geometric mean | median | range       | above cuBLAS |
+|-------------------------------------|----------------|--------|-------------|--------------|
+| v6, clocks locked at 1710 MHz       | 99.8%          | 100.6% | 78.1–122.0% | 13 of 25     |
+| **v7**, default clocks, two runs    | **102.4%**     | 101.8% | 85.5–123.8% | **15 of 25** |
+
+At default clocks the card runs these kernels at its 370 W limit, and v6 timed in
+the same runs gives 100.4 and 99.9%. The v7 figures are the mean of the two runs,
+size by size.
 
 With 68 SMs, a grid takes `ceil(blocks/68)` rounds for `blocks/68` of work, and
 [a model](docs/wave-quantization.md) whose only free parameter is the plateau
 predicts 24 of the 25 sizes within 3%. The 78% is n=1152, 1.19 blocks per SM
 paid at the price of 2.
 
-## From v1 to v6
+## From v1 to v7
 
 Each step in detail is in [`docs/gemm.md`](docs/gemm.md).
 
@@ -53,10 +58,12 @@ Each step in detail is in [`docs/gemm.md`](docs/gemm.md).
 | v5 | each thread's columns split into two groups, half a tile apart | bank conflicts from 268M to 0 as predicted, +11 to +13 points |
 | v6 | a warp tier between the block tile and the thread tile | a third fewer shared-memory wavefronts at the same register count, +4% on average |
 | + | a second tile, 256×128, picked per size by the quantization model | the faster of the two on 13 of 13 sizes, without timing them |
+| v7 | both tiles staged with `cp.async`, A transposed by 4-byte copies, BK=16 on 3 stages, the next fragments read a step ahead, cuBLAS's FFMA order | from 93.7% to 98.8% at n=4096, +2 points on the 25-size mean, in the same runs |
 
-Stream-K and `cp.async` were built and measured, and neither ships: Stream-K
-lifts n=1152 from 78% to 93% but costs 19 registers and ~43% on the large sizes,
-and `cp.async` costs 6.5% on this addressing scheme.
+A hybrid Stream-K on v7's last wave reaches 106.6% on the mean and 102.7% at
+n=4096, but it needs a workspace and a second kernel, so it does not ship, and
+neither does split-K. `cp.async` on B alone costs 6.5%, which is why v7 copies
+both operands.
 
 ## Attention
 

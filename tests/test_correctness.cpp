@@ -161,6 +161,13 @@ int main() {
     // moves, but whichever kernel runs is still checked against the oracle.
     check_v3_aligned(256, 8704, 32); // -> 256x128 tile here
     check_v3_aligned(384,  256, 64); // -> 128x128 tile, M not a 256 multiple
+    // v7 runs when K % 16 == 0 and the grid takes more than one wave. K covers
+    // 1, 2, 3 and 5 tiles of 16, against 3 stages on the big tile and 2 on the small.
+    check_v3_aligned(2048, 1024, 16); // -> v7 256x128, one K tile
+    check_v3_aligned(256, 8704, 48);  // -> v7 256x128, three K tiles
+    check_v3_aligned(1280, 1280, 80); // -> v7 256x128, five K tiles
+    check_v3_aligned(1536, 1536, 32); // -> v7 128x128, two K tiles
+    check_v3_aligned(1536, 1536, 48); // -> v7 128x128, three K tiles
 
     // cuBLAS baseline vs naive: validates the row-major <-> column-major swap
     // (C^T = B^T A^T) before the benchmark quotes any "% of cuBLAS" number.

@@ -746,6 +746,155 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
     }
 }
 
+// v7 stages both tiles with cp.async (sm_80+). A is copied 4 bytes at a time so
+// it lands transposed, as in cuBLAS's _align1 kernel.
+__device__ __forceinline__ void cp_async4(float* dst, const float* src) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(d), "l"(src));
+#endif
+}
+__device__ __forceinline__ void cp_async16(float* dst, const float* src) {
+#if __CUDA_ARCH__ >= 800
+    const unsigned d = (unsigned)__cvta_generic_to_shared(dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(d), "l"(src));
+#endif
+}
+__device__ __forceinline__ void cp_async_commit() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N> __device__ __forceinline__ void cp_async_wait() {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+
+template <int BM, int BN, int WM, int WN, int TM, int TN, int STAGES, int MIN_BLOCKS>
+__global__ void __launch_bounds__((BM*BN)/(TM*TN), MIN_BLOCKS)
+gemm_reg_v7_kernel(int M, int N, int K, float alpha,
+                   const float* __restrict__ A, const float* __restrict__ B,
+                   float beta, float* __restrict__ C) {
+#if __CUDA_ARCH__ >= 800
+    constexpr int BK = 16, PAD = 4, KH = BK / 8;
+    constexpr int NT     = (BM * BN) / (TM * TN);
+    constexpr int PA     = BM * BK / NT;   // 4-byte copies of A per thread and tile
+    constexpr int WCOLS  = BN / WN;
+    constexpr int WSUB_N = WN / TN;
+    constexpr int GW = 4;
+    constexpr int GN = TN / GW, SPN = WN / GN;
+    constexpr int GM = TM / GW, SPM = WM / GM;
+    constexpr int B4 = (BK * BN / 4) / NT, BR = NT / (BN / 4);
+    constexpr int AS = BM + PAD;   // +4 keeps a warp's copies on distinct banks
+    static_assert(PA % KH == 0 && BK % PA == 0 && STAGES >= 2, "copy layout");
+    static_assert((WM/TM) * WSUB_N == 32, "a warp must be exactly 32 threads");
+
+    extern __shared__ float4 smem4[];
+    float* As = reinterpret_cast<float*>(smem4);
+    float* Bs = As + STAGES * BK * AS;
+
+    const int blockRow = blockIdx.y * BM;
+    const int blockCol = blockIdx.x * BN;
+    const int tid  = threadIdx.x;
+    const int warp = tid / 32, lane = tid % 32;
+    const int warpRow = (warp / WCOLS) * WM;
+    const int warpCol = (warp % WCOLS) * WN;
+    const int rowBase = warpRow + (lane / WSUB_N) * GW;
+    const int colBase = warpCol + (lane % WSUB_N) * GW;
+    const int innerRowB = tid / (BN / 4), innerColB = tid % (BN / 4);
+    const int am = tid / 8, ak = tid % 8;
+    const int KT = K / BK;
+
+    const float* pA = A + (size_t)(blockRow + am) * K + ak;
+    const float* pB = B + (size_t)innerRowB * N + blockCol + innerColB * 4;
+    float* sA = As + ak * AS + am;
+    float* sB = Bs + innerRowB * BN + innerColB * 4;
+    auto copyA = [&](int s, int kt, int p) {
+        cp_async4(sA + s * BK * AS + (p % KH) * 8 * AS + (p / KH) * (NT / 8),
+                  pA + ((size_t)(p / KH) * (NT / 8) * K + (size_t)kt * BK + (p % KH) * 8));
+    };
+    auto copyB = [&](int s, int kt) {
+        #pragma unroll
+        for (int q = 0; q < B4; ++q)
+            cp_async16(sB + s * BK * BN + q * BR * BN, pB + ((size_t)kt * BK + q * BR) * N);
+    };
+
+    #pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (s < KT) {
+            copyB(s, s);
+            #pragma unroll
+            for (int p = 0; p < PA; ++p) copyA(s, s, p);
+        }
+        cp_async_commit();
+    }
+
+    float acc[TM][TN] = {};
+    int rs = 0, ws = STAGES - 1;
+
+    for (int kt = 0; kt < KT; ++kt) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        // past the last tile, the copies refill a stage nobody reads
+        const int src = min(kt + STAGES - 1, KT - 1);
+        const float* as = As + rs * BK * AS;
+        const float* bs = Bs + rs * BK * BN;
+        float fM[2][TM], fN[2][TN];
+        auto frag = [&](int f, int kk) {
+            #pragma unroll
+            for (int g = 0; g < GM; ++g) {
+                const float4 v = *reinterpret_cast<const float4*>(&as[kk*AS + rowBase + g*SPM]);
+                fM[f][g*GW+0] = v.x; fM[f][g*GW+1] = v.y; fM[f][g*GW+2] = v.z; fM[f][g*GW+3] = v.w;
+            }
+            #pragma unroll
+            for (int g = 0; g < GN; ++g) {
+                const float4 v = *reinterpret_cast<const float4*>(&bs[kk*BN + colBase + g*SPN]);
+                fN[f][g*GW+0] = v.x; fN[f][g*GW+1] = v.y; fN[f][g*GW+2] = v.z; fN[f][g*GW+3] = v.w;
+            }
+        };
+        frag(0, 0);
+        #pragma unroll
+        for (int kk = 0; kk < BK; ++kk) {
+            if (kk + 1 < BK) frag((kk + 1) & 1, kk + 1);
+            if (kk == 0) copyB(ws, src);
+            if (kk % (BK / PA) == 0) copyA(ws, src, kk / (BK / PA));
+            // cuBLAS's order, pairs of rows with the columns in serpentine
+            #pragma unroll
+            for (int p = 0; p < TM / 2; ++p)
+                #pragma unroll
+                for (int jj = 0; jj < TN; ++jj) {
+                    const int j  = (p & 1) ? TN - 1 - jj : jj;
+                    const int i0 = 2 * p + (jj & 1), i1 = 2 * p + 1 - (jj & 1);
+                    acc[i0][j] += fM[kk & 1][i0] * fN[kk & 1][j];
+                    acc[i1][j] += fM[kk & 1][i1] * fN[kk & 1][j];
+                }
+        }
+        cp_async_commit();
+        rs = rs + 1 == STAGES ? 0 : rs + 1;
+        ws = ws + 1 == STAGES ? 0 : ws + 1;
+    }
+    cp_async_wait<0>();
+
+    #pragma unroll
+    for (int t = 0; t < TM; ++t) {
+        const int gRow = blockRow + rowBase + (t / GW) * SPM + (t % GW);
+        #pragma unroll
+        for (int g = 0; g < GN; ++g) {
+            const size_t idx = (size_t)gRow * N + blockCol + colBase + g * SPN;
+            float4 out = { alpha * acc[t][g*GW+0], alpha * acc[t][g*GW+1],
+                           alpha * acc[t][g*GW+2], alpha * acc[t][g*GW+3] };
+            if (beta != 0.0f) {
+                const float4 c = *reinterpret_cast<float4*>(&C[idx]);
+                out.x += beta * c.x; out.y += beta * c.y;
+                out.z += beta * c.z; out.w += beta * c.w;
+            }
+            *reinterpret_cast<float4*>(&C[idx]) = out;
+        }
+    }
+#endif
+}
+
 // v6_big is the 256x128 tile cuBLAS picks on this card.
 #define GEMM_V6_SMALL 128, 128, 128, 16,  8, 8
 #define GEMM_V6_BIG   256, 128, 256, 16, 16, 8
@@ -764,6 +913,28 @@ static bool pick_big_tile(int M, int N, int sm) {
     const int small = (M / 128) * (N / 128);
     const int big   = (M / 256) * (N / 128);
     return wave_efficiency(big, sm) >= wave_efficiency(small, sm);
+}
+
+// 256x128 on 3 stages (74.5 KB, one block per SM), 128x128 on 2 (32.5 KB, two).
+#define GEMM_V7_BIG   256, 128, 256, 16, 16, 8, 3, 1
+#define GEMM_V7_SMALL 128, 128, 128, 16,  8, 8, 2, 2
+
+template <int BM, int BN, int WM, int WN, int TM, int TN, int STAGES, int MIN_BLOCKS>
+static void launch_v7(int M, int N, int K, float alpha,
+                      const float* A, const float* B, float beta, float* C) {
+    constexpr int bytes = STAGES * 16 * (BM + 4 + BN) * (int)sizeof(float);
+    auto kernel = gemm_reg_v7_kernel<BM, BN, WM, WN, TM, TN, STAGES, MIN_BLOCKS>;
+    static bool opted_in = false;   // above 48 KB the kernel must opt in
+    if (!opted_in) {
+        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        opted_in = true;
+    }
+    kernel<<<dim3(N / BN, M / BM), (BM*BN)/(TM*TN), bytes>>>(M, N, K, alpha, A, B, beta, C);
+}
+
+// One wave or less stays on v6, where BK=8 gives a short K loop twice the steps.
+static bool use_v7(int M, int N, int K, int major, int sm) {
+    return major >= 8 && K % 16 == 0 && (M / 128) * (N / 128) > sm;
 }
 
 void gemm_cuda_v3(int M, int N, int K, float alpha,
@@ -786,13 +957,18 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
     if (beta != 0.0f)
         CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
 
-    int dev = 0, smCount = 0;
+    int dev = 0, smCount = 0, major = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, dev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
+    const bool v7 = use_v7(M, N, K, major, smCount);
 
     if (pick_big_tile(M, N, smCount)) {
-        gemm_reg_v6_kernel<GEMM_V6_BIG, 1><<<dim3(N / 128, M / 256), 256>>>(
-            M, N, K, alpha, dA, dB, beta, dC);
+        if (v7) launch_v7<GEMM_V7_BIG>(M, N, K, alpha, dA, dB, beta, dC);
+        else    gemm_reg_v6_kernel<GEMM_V6_BIG, 1><<<dim3(N / 128, M / 256), 256>>>(
+                    M, N, K, alpha, dA, dB, beta, dC);
+    } else if (v7) {
+        launch_v7<GEMM_V7_SMALL>(M, N, K, alpha, dA, dB, beta, dC);
     } else {
         // <1> while the grid cannot seat two blocks per SM, <2> once it can.
         const dim3 grid(N / 128, M / 128);
@@ -877,21 +1053,29 @@ void benchmark_gemm_versions(int M, int N, int K) {
     auto run_v5lb = [&](int i){ gemm_reg_v5_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
     // v6 goes through gemm_cuda_v3's dispatch, so the bench times what the API
     // launches.
-    int smCount = 0, bdev = 0;
+    int smCount = 0, bdev = 0, major = 0;
     CUDA_CHECK(cudaGetDevice(&bdev));
     CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, bdev));
+    CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, bdev));
     const bool big = v3ok && pick_big_tile(M, N, smCount);
+    const bool v7ok = v3ok && use_v7(M, N, K, major, smCount);
     const dim3 gbig(N / 128, big ? M / 256 : 1);
     auto run_v6   = [&](int i){
         if (big) gemm_reg_v6_kernel<GEMM_V6_BIG,   1><<<gbig, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC);
         else     gemm_reg_v6_kernel<GEMM_V6_SMALL, 2><<<g3v,  b2>>>(M, N, K, alpha, A(i), B(i), beta, dC);
     };
-    run_v1(0); run_v2(0); if (v3ok) { run_v3(0); run_v3db(0); run_v4(0); run_v5(0); run_v5lb(0); run_v6(0); } run_cb(0); CUDA_CHECK(cudaDeviceSynchronize());
+    auto run_v7   = [&](int i){
+        if (big) launch_v7<GEMM_V7_BIG>  (M, N, K, alpha, A(i), B(i), beta, dC);
+        else     launch_v7<GEMM_V7_SMALL>(M, N, K, alpha, A(i), B(i), beta, dC);
+    };
+    run_v1(0); run_v2(0); if (v3ok) { run_v3(0); run_v3db(0); run_v4(0); run_v5(0); run_v5lb(0); run_v6(0); }
+    if (v7ok) run_v7(0);
+    run_cb(0); CUDA_CHECK(cudaDeviceSynchronize());
 
-    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, i6 = 0, i7 = 0, i8 = 0, ib = 0;
+    int i1 = 0, i2 = 0, i3 = 0, i4 = 0, i5 = 0, i6 = 0, i7 = 0, i8 = 0, i9 = 0, ib = 0;
     const double t1 = bench::ms_per_iter(run_v1, &i1);
     const double t2 = bench::ms_per_iter(run_v2, &i2);
-    double t3 = 0.0, t4 = 0.0, t5 = 0.0, t6 = 0.0, t7 = 0.0, t8 = 0.0;
+    double t3 = 0.0, t4 = 0.0, t5 = 0.0, t6 = 0.0, t7 = 0.0, t8 = 0.0, t9 = 0.0;
     if (v3ok) {
         t3 = bench::ms_per_iter(run_v3,   &i3);
         t4 = bench::ms_per_iter(run_v3db, &i4);
@@ -900,6 +1084,7 @@ void benchmark_gemm_versions(int M, int N, int K) {
         t7 = bench::ms_per_iter(run_v5lb, &i7);
         t8 = bench::ms_per_iter(run_v6,   &i8);
     }
+    if (v7ok) t9 = bench::ms_per_iter(run_v7, &i9);
     const double tb = bench::ms_per_iter(run_cb, &ib);
 
     const double gflop = 2.0 * (double)M * N * K / 1e9;
@@ -915,6 +1100,10 @@ void benchmark_gemm_versions(int M, int N, int K) {
         std::printf("  v5 Bs-split      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t6, g6f, 100.0 * g6f / gbf, i6);
         std::printf("  v5 Bs-split+lb   : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t7, g7f, 100.0 * g7f / gbf, i7);
         std::printf("  v6 warp-tiled    : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t8, g8f, 100.0 * g8f / gbf, i8);
+    }
+    if (v7ok) {
+        const double g9f = gflop / (t9 / 1e3);
+        std::printf("  v7 cp.async      : %7.3f ms/iter  %8.2f GFLOP/s   (%5.1f%% of cuBLAS)  [%4d it]\n", t9, g9f, 100.0 * g9f / gbf, i9);
     }
     std::printf("  cuBLAS SGEMM     : %7.3f ms/iter  %8.2f GFLOP/s                       [%4d it]\n", tb, gbf, ib);
     std::printf("  register-tiling speedup v1->v2 : %.2fx\n", t1 / t2);

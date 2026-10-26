@@ -13,8 +13,9 @@ void gemm_cuda(int M, int N, int K, float alpha,
 void gemm_cuda_reg(int M, int N, int K, float alpha,
                    const float* A, const float* B, float beta, float* C);
 
-// The fast kernel, v6 today. M and N must be multiples of 128 and K of 8,
-// otherwise it falls back to v2.
+// The fast kernel. M and N must be multiples of 128 and K of 8, otherwise it
+// falls back to v2. It runs v7 on sm_80+ when K % 16 == 0 and the grid takes
+// more than one wave, v6 otherwise.
 void gemm_cuda_v3(int M, int N, int K, float alpha,
                   const float* A, const float* B, float beta, float* C);
 
@@ -22,7 +23,7 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
 void gemm_cublas(int M, int N, int K, float alpha,
                  const float* A, const float* B, float beta, float* C);
 
-// Times v1 to v6 and cuBLAS back to back on the device.
+// Times v1 to v7 and cuBLAS back to back on the device.
 void benchmark_gemm_versions(int M, int N, int K);
 
 // C = act(alpha*A*B + beta*C + bias[col]) in one launch. bias has length N, or

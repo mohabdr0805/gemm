@@ -327,6 +327,43 @@ shows 5%: it profiles one launch in isolation, at base clocks, with caches
 flushed, while the benchmark runs two dozen back to back. Its counters are what
 the section above uses, not its wall time.
 
+## GPU v7 — `gemm_reg_v7_kernel` (`cp.async` on both tiles)
+
+Up to v6, each thread loads its share of the next tile into registers and stores
+it to shared memory after the compute. Ampere's `cp.async` copies from global to
+shared directly, but on B alone it costs 6.5%: the copies share the MIO queue
+with A's loads and stores, and `mio_throttle` goes from 1.5% to 4.7%. It pays
+only when it replaces the whole staging.
+
+A is the harder half, because As is stored transposed and a copy does not
+scatter. v7 copies A 4 bytes at a time, 8 lanes on the k of one row, into rows
+of As padded by 4 floats so a warp's copies land on distinct banks, as cuBLAS's
+`_align1` kernel does. At n=4096, `cp.async` on both tiles and BK=16 on 3 stages
+bring about 3 of the 5 points over v6, and reading the next fragments a step
+ahead with cuBLAS's FFMA order brings the rest.
+
+| ncu, n=4096                    | v6      | v7          | cuBLAS  |
+|--------------------------------|---------|-------------|---------|
+| time, median of 8 launches     | 7.94 ms | **7.39 ms** | 7.42 ms |
+| issue slots used               | 79.7%   | **87.6%**   | 87.8%   |
+| FMA pipe                       | 73.7%   | **79.4%**   | 79.1%   |
+| `wait`                         | 3.8%    | **0.6%**    | 0.4%    |
+| `barrier`                      | 3.1%    | 1.3%        | 4.5%    |
+| `short_scoreboard`             | 6.6%    | 8.1%        | 4.2%    |
+| global loads + shared stores   | 25.2M   | 0           | 0.5M    |
+| `cp.async`                     | 0       | 19.0M       | 25.3M   |
+
+With the clock locked at its 1440 MHz base by Nsight Compute, v7 is faster than
+cuBLAS in 8 of 8 alternated launches, 7.39 ms against 7.42 ms. The one stall
+where it is still behind is `short_scoreboard`, the wait on shared-memory loads, with 1.47
+times as many of them.
+
+At default clocks these kernels run at the card's 370 W limit, and v7 gets 1 to
+3% less clock than cuBLAS for the same power. At 1500 MHz, where neither reaches
+the limit, v7 measures 100.4%. ptxas also places 3 dummy shared loads before
+each group of copies, 48 in the loop, where cuBLAS's own build has none. Removed
+from the binary, they are worth 2.7 points, which `nvcc` gives no way to reach.
+
 ## Inference — `gemm_bias_act_kernel` (fused bias + activation)
 
 A linear layer computes `Y = act(X·W + bias)`. Naively that is two kernels: the
