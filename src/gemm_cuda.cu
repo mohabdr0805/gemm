@@ -1,16 +1,16 @@
-// GEMM on the GPU: C = alpha*A*B + beta*C, row-major.
-// Holds the shared-memory tiled kernel (v1), the register-tiled kernel (v2),
-// and the fused bias+activation epilogue used for inference.
+// GEMM on the GPU, C = alpha*A*B + beta*C in row-major. When beta is 0, C is
+// never read, as in BLAS.
+
 #include "gemm/gemm_cuda.cuh"
 #include "bench_timing.cuh"
 
 #include <cuda_runtime.h>
-#include <cublas_v2.h> // vendor baseline: the number our kernels are measured against
+#include <cublas_v2.h>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring> // std::memset, for the beta==0 quick return
-#include <cmath>   // std::ceil, for the wave-quantization dispatch
-#include <vector>  // the benchmark's rotated input buffers
+#include <cstring>
+#include <cmath>
+#include <vector>
 
 #define TILE 16
 
@@ -36,21 +36,18 @@
 
 namespace gemm {
 
-// BLAS quick return, shared by the wrappers below: M == 0 and N == 0 are no-ops,
-// K == 0 is C = beta*C. Neither can reach a kernel. A zero grid dimension is a
-// launch error, and the v3/v5 prologue stages its first K-tile unconditionally,
-// so at K == 0 it would read a float4 past a zero-byte A. C is a host buffer
-// here, so K == 0 is a host-side scaling.
+// Empty shapes and K at 0 never reach a kernel, because a zero grid is a launch
+// error and the v3+ prologue would read past A.
 static bool gemm_quick_return(int M, int N, int K, float beta, float* C) {
-    if (M <= 0 || N <= 0) return true;   // empty C, nothing to write
-    if (K > 0) return false;             // real work to do
+    if (M <= 0 || N <= 0) return true;
+    if (K > 0) return false;
     const size_t n = (size_t)M * N;
-    if (beta == 0.0f) std::memset(C, 0, n * sizeof(float)); // C is write-only
+    if (beta == 0.0f) std::memset(C, 0, n * sizeof(float));
     else for (size_t i = 0; i < n; ++i) C[i] *= beta;
     return true;
 }
 
-// v1: shared-memory tiled. As/Bs padded to TILE+1 to dodge bank conflicts.
+// v1 tiles A and B in shared memory, padded to TILE+1 against bank conflicts.
 __global__ void gemm_kernel(int M, int N, int K, float alpha,
                             const float* __restrict__ A,
                             const float* __restrict__ B,
@@ -81,14 +78,13 @@ __global__ void gemm_kernel(int M, int N, int K, float alpha,
     if (row < M && col < N) {
         const size_t idx = (size_t)row * N + col;
         float out = alpha * acc;
-        if (beta != 0.0f) out += beta * C[idx]; // beta==0: C write-only (BLAS)
+        if (beta != 0.0f) out += beta * C[idx];
         C[idx] = out;
     }
 }
 
-// Same tiling as gemm_kernel, but the epilogue adds bias[col] and applies the
-// activation before the global write -> one pass, one launch. ACT is a template
-// parameter, so apply_act() folds away at compile time (no branch in the loop).
+// Bias and activation are applied before the write, so the layer takes one
+// launch.
 template <Activation ACT>
 __global__ void gemm_bias_act_kernel(int M, int N, int K, float alpha,
                                      const float* __restrict__ A,
@@ -121,14 +117,12 @@ __global__ void gemm_bias_act_kernel(int M, int N, int K, float alpha,
     if (row < M && col < N) {
         const size_t idx = (size_t)row * N + col;
         float v = alpha * acc;
-        if (beta != 0.0f) v += beta * C[idx]; // beta==0: C write-only (BLAS)
+        if (beta != 0.0f) v += beta * C[idx];
         if (bias) v += bias[col];
         C[idx] = apply_act(ACT, v);
     }
 }
 
-// The non-fused path: a separate element-wise bias+activation pass. This is the
-// extra global-memory pass that fusion removes; kept only for the benchmark.
 template <Activation ACT>
 __global__ void bias_act_kernel(int M, int N, float* __restrict__ C,
                                 const float* __restrict__ bias) {
@@ -155,7 +149,7 @@ void gemm_cuda(int M, int N, int K, float alpha,
 
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+    if (beta != 0.0f)
         CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
 
     dim3 block(TILE, TILE);
@@ -168,7 +162,6 @@ void gemm_cuda(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// Pick the right template instantiation for a runtime `act`.
 static void launch_fused(dim3 grid, dim3 block, int M, int N, int K, float alpha,
                          const float* dA, const float* dB, float beta,
                          float* dC, const float* dbias, Activation act) {
@@ -185,7 +178,7 @@ static void launch_fused(dim3 grid, dim3 block, int M, int N, int K, float alpha
 void gemm_bias_act_cuda(int M, int N, int K, float alpha,
                         const float* A, const float* B, float beta, float* C,
                         const float* bias, Activation act) {
-    // Same quick return, except the epilogue still applies at K == 0.
+    // the epilogue still applies at K == 0
     if (M <= 0 || N <= 0) return;
     if (K <= 0) {
         for (int i = 0; i < M; ++i)
@@ -208,7 +201,7 @@ void gemm_bias_act_cuda(int M, int N, int K, float alpha,
     CUDA_CHECK(cudaMalloc(&dC, sc));
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+    if (beta != 0.0f)
         CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
     if (bias) {
         CUDA_CHECK(cudaMalloc(&dbias, sbias));
@@ -226,8 +219,6 @@ void gemm_bias_act_cuda(int M, int N, int K, float alpha,
     if (dbias) cudaFree(dbias);
 }
 
-// Fused vs two-pass, timed on the device (cudaEvent), excluding transfers and
-// malloc. alpha=1, beta=0 is the inference linear layer Y = act(X*W + b).
 void benchmark_fusion(int M, int N, int K, Activation act) {
     const float alpha = 1.0f, beta = 0.0f;
     const size_t sa = (size_t)M * K * sizeof(float);
@@ -235,9 +226,6 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
     const size_t sc = (size_t)M * N * sizeof(float);
     const size_t sbias = (size_t)N * sizeof(float);
 
-    // Rotated inputs, same rule as the other benchmarks. This one samples shapes
-    // as small as 256x256x256, where A and B together are 768 KB against a 5 MB
-    // L2, so a fixed pair of buffers would be read entirely from cache.
     const int k = bench::rotation_copies(sa + sb);
     std::vector<float*> dAs(k), dBs(k);
     for (int i = 0; i < k; ++i) {
@@ -279,16 +267,13 @@ void benchmark_fusion(int M, int N, int K, Activation act) {
     cudaFree(dC); cudaFree(dbias);
 }
 
-// v2: register tiling. 128x128 block tile, K in steps of BK=8, 256 threads, each
-// thread holding an 8x8 micro-block of C in registers. Every shared-memory load
-// feeds 8 FMAs (8x8 outer product), so arithmetic intensity is much higher than
-// v1 -- the real lever once occupancy is saturated.
+// v2 keeps an 8x8 block of C in registers per thread.
 __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
                                 const float* __restrict__ A,
                                 const float* __restrict__ B,
                                 float beta, float* __restrict__ C) {
     constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
-    constexpr int NT = (BM / TM) * (BN / TN); // 256 threads/block
+    constexpr int NT = (BM / TM) * (BN / TN);
 
     __shared__ float As[BM * BK];
     __shared__ float Bs[BK * BN];
@@ -307,7 +292,6 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
         for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;
     float regM[TM], regN[TN];
 
-    // Indices for the cooperative load of the BM*BK and BK*BN shared tiles.
     const int innerRowA = tid / BK, innerColA = tid % BK, strideA = NT / BK;
     const int innerRowB = tid / BN, innerColB = tid % BN, strideB = NT / BN;
 
@@ -350,7 +334,7 @@ __global__ void gemm_reg_kernel(int M, int N, int K, float alpha,
             if (gCol >= N) continue;
             const size_t idx = (size_t)gRow * N + gCol;
             float out = alpha * acc[i][j];
-            if (beta != 0.0f) out += beta * C[idx]; // beta==0: C write-only (BLAS)
+            if (beta != 0.0f) out += beta * C[idx];
             C[idx] = out;
         }
     }
@@ -369,7 +353,7 @@ void gemm_cuda_reg(int M, int N, int K, float alpha,
     CUDA_CHECK(cudaMalloc(&dC, sc));
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+    if (beta != 0.0f)
         CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
 
     constexpr int BM = 128, BN = 128;
@@ -383,50 +367,38 @@ void gemm_cuda_reg(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// v3: v2 + two changes ncu pointed at. (1) Global loads are vectorized to float4
-// (128-bit) -> a quarter of the load instructions, fully coalesced. (2) The As
-// tile is stored TRANSPOSED (As[k][m] instead of As[m][k]), so the compute
-// loop's `regM[i] = As[kk][row+i]` reads 8 CONTIGUOUS floats instead of striding
-// by BK. NB: re-profiling showed this did NOT move the ~268M shared-load bank
-// conflicts -- those are dominated by the Bs read, untouched here -- so the win
-// is the 4x fewer global-load instructions, not the conflicts (see README v3).
-// Fast path for aligned sizes (M,N % 128 == 0, K % 8 == 0, needed for the
-// unguarded float4 loads); any other shape falls back to v2.
+// v3 adds float4 loads and a transposed As. The loads are unguarded, so M and N
+// must be multiples of 128 and K of 8.
 __global__ void gemm_reg_v3_kernel(int M, int N, int K, float alpha,
                                    const float* __restrict__ A,
                                    const float* __restrict__ B,
                                    float beta, float* __restrict__ C) {
     constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
 
-    __shared__ float As[BK * BM]; // TRANSPOSED: As[k * BM + m]
-    __shared__ float Bs[BK * BN]; // Bs[k * BN + n]
+    __shared__ float As[BK * BM]; // transposed, As[k * BM + m]
+    __shared__ float Bs[BK * BN];
 
     const int blockRow = blockIdx.y * BM;
     const int blockCol = blockIdx.x * BN;
     const int tid = threadIdx.x;
-    const int threadCol = tid % (BN / TN); // 0..15
-    const int threadRow = tid / (BN / TN); // 0..15
+    const int threadCol = tid % (BN / TN);
+    const int threadRow = tid / (BN / TN);
 
-    // One float4 per thread per tile. A: 128 rows x (8/4=2) col-groups = 256.
-    const int innerRowA = tid / (BK / 4);  // 0..127 (the m this thread loads)
-    const int innerColA = tid % (BK / 4);  // 0..1  -> *4 = k offset {0,4}
-    // B: (8) rows x (128/4=32) col-groups = 256.
-    const int innerRowB = tid / (BN / 4);  // 0..7  (the k this thread loads)
-    const int innerColB = tid % (BN / 4);  // 0..31 -> *4 = n offset
+    const int innerRowA = tid / (BK / 4);
+    const int innerColA = tid % (BK / 4);
+    const int innerRowB = tid / (BN / 4);
+    const int innerColB = tid % (BN / 4);
 
     float acc[TM][TN] = {};
     float regM[TM], regN[TN];
 
     for (int k0 = 0; k0 < K; k0 += BK) {
-        // (1) load 4 consecutive K-values of one A row, (2) scatter them into 4
-        //     different rows of the transposed As tile (As[k][m]).
         const float4 a4 = *reinterpret_cast<const float4*>(
             &A[(size_t)(blockRow + innerRowA) * K + k0 + innerColA * 4]);
         As[(innerColA * 4 + 0) * BM + innerRowA] = a4.x;
         As[(innerColA * 4 + 1) * BM + innerRowA] = a4.y;
         As[(innerColA * 4 + 2) * BM + innerRowA] = a4.z;
         As[(innerColA * 4 + 3) * BM + innerRowA] = a4.w;
-        // B is already row-major k x n: one float4 in, one float4 out, contiguous.
         *reinterpret_cast<float4*>(&Bs[innerRowB * BN + innerColB * 4]) =
             *reinterpret_cast<const float4*>(
                 &B[(size_t)(k0 + innerRowB) * N + blockCol + innerColB * 4]);
@@ -435,9 +407,9 @@ __global__ void gemm_reg_v3_kernel(int M, int N, int K, float alpha,
         #pragma unroll
         for (int kk = 0; kk < BK; ++kk) {
             #pragma unroll
-            for (int i = 0; i < TM; ++i) regM[i] = As[kk * BM + threadRow * TM + i]; // contiguous
+            for (int i = 0; i < TM; ++i) regM[i] = As[kk * BM + threadRow * TM + i];
             #pragma unroll
-            for (int j = 0; j < TN; ++j) regN[j] = Bs[kk * BN + threadCol * TN + j]; // contiguous
+            for (int j = 0; j < TN; ++j) regN[j] = Bs[kk * BN + threadCol * TN + j];
             #pragma unroll
             for (int i = 0; i < TM; ++i)
                 #pragma unroll
@@ -446,7 +418,6 @@ __global__ void gemm_reg_v3_kernel(int M, int N, int K, float alpha,
         __syncthreads();
     }
 
-    // Epilogue: write C in float4 (each thread owns an 8x8 block, aligned).
     #pragma unroll
     for (int i = 0; i < TM; ++i) {
         const int gRow = blockRow + threadRow * TM + i;
@@ -465,11 +436,8 @@ __global__ void gemm_reg_v3_kernel(int M, int N, int K, float alpha,
     }
 }
 
-// v3 + double buffering: each step prefetches the next tile into registers while
-// computing the current one from shared, then swaps, overlapping load latency
-// with the FMAs. MIN_BLOCKS is the launch_bounds occupancy target -- at 1, ptxas
-// uses 130 registers (one block/SM); forcing 2 pins it to the 128-register cliff,
-// no spill, occupancy doubled. Details in the v4 README section.
+// v3 with double buffering, so the next loads overlap the compute. The build
+// with MIN_BLOCKS = 2 is v4.
 template <int MIN_BLOCKS>
 __global__ void __launch_bounds__(256, MIN_BLOCKS)
 gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
@@ -478,7 +446,7 @@ gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
                                      float beta, float* __restrict__ C) {
     constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
 
-    __shared__ float As[2][BK * BM]; // double-buffered, transposed As[buf][k*BM+m]
+    __shared__ float As[2][BK * BM];
     __shared__ float Bs[2][BK * BN];
 
     const int blockRow = blockIdx.y * BM;
@@ -492,7 +460,6 @@ gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
     float acc[TM][TN] = {};
     float regM[TM], regN[TN];
 
-    // Prologue: stage tile 0 into buffer 0.
     {
         const float4 a4 = *reinterpret_cast<const float4*>(
             &A[(size_t)(blockRow + innerRowA) * K + innerColA * 4]);
@@ -510,7 +477,7 @@ gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
     for (int k0 = 0; k0 < K; k0 += BK) {
         const bool has_next = (k0 + BK < K);
         float4 a_next, b_next;
-        if (has_next) { // issue next tile's global loads NOW (in flight during compute)
+        if (has_next) {
             a_next = *reinterpret_cast<const float4*>(
                 &A[(size_t)(blockRow + innerRowA) * K + (k0 + BK) + innerColA * 4]);
             b_next = *reinterpret_cast<const float4*>(
@@ -529,7 +496,7 @@ gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
                 for (int j = 0; j < TN; ++j) acc[i][j] += regM[i] * regN[j];
         }
 
-        if (has_next) { // land the prefetched tile in the other buffer, then swap
+        if (has_next) {
             As[1-buf][(innerColA*4+0)*BM + innerRowA] = a_next.x;
             As[1-buf][(innerColA*4+1)*BM + innerRowA] = a_next.y;
             As[1-buf][(innerColA*4+2)*BM + innerRowA] = a_next.z;
@@ -558,15 +525,8 @@ gemm_reg_v3db_kernel(int M, int N, int K, float alpha,
     }
 }
 
-// v5: v4 + conflict-free Bs reads. The ~268M shared-load bank conflicts ncu has
-// reported unchanged since v2 all come from the Bs read: `threadCol * TN`
-// strides a warp's 16 columns by 8 floats, so their reads land on 4 of the 32
-// banks (4-way conflict; the As read is a broadcast, 2 addresses per warp, and
-// contributes none). Fix: split each thread's 8 output columns into two groups
-// of 4, at threadCol*4 and threadCol*4 + BN/2 -- a warp's 16 threads then read
-// 128 CONTIGUOUS floats, covering all 32 banks. Note what does NOT change: the
-// staging, the tile layout in shared, the FMA loop. Only which columns a thread
-// OWNS changes (ownership, not layout), so the epilogue moves with it.
+// v5 splits each thread's 8 columns into two groups half a tile apart, so a
+// warp's Bs reads hit all 32 banks.
 template <int MIN_BLOCKS>
 __global__ void __launch_bounds__(256, MIN_BLOCKS)
 gemm_reg_v5_kernel(int M, int N, int K, float alpha,
@@ -574,9 +534,9 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
                    const float* __restrict__ B,
                    float beta, float* __restrict__ C) {
     constexpr int BM = 128, BN = 128, BK = 8, TM = 8, TN = 8;
-    constexpr int HN = BN / 2; // the two column groups sit half a tile apart
+    constexpr int HN = BN / 2;
 
-    __shared__ float As[2][BK * BM]; // double-buffered, transposed As[buf][k*BM+m]
+    __shared__ float As[2][BK * BM];
     __shared__ float Bs[2][BK * BN];
 
     const int blockRow = blockIdx.y * BM;
@@ -590,7 +550,6 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
     float acc[TM][TN] = {};
     float regM[TM], regN[TN];
 
-    // Prologue: stage tile 0 into buffer 0.
     {
         const float4 a4 = *reinterpret_cast<const float4*>(
             &A[(size_t)(blockRow + innerRowA) * K + innerColA * 4]);
@@ -608,7 +567,7 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
     for (int k0 = 0; k0 < K; k0 += BK) {
         const bool has_next = (k0 + BK < K);
         float4 a_next, b_next;
-        if (has_next) { // issue next tile's global loads NOW (in flight during compute)
+        if (has_next) {
             a_next = *reinterpret_cast<const float4*>(
                 &A[(size_t)(blockRow + innerRowA) * K + (k0 + BK) + innerColA * 4]);
             b_next = *reinterpret_cast<const float4*>(
@@ -620,7 +579,7 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
             #pragma unroll
             for (int i = 0; i < TM; ++i) regM[i] = As[buf][kk*BM + threadRow*TM + i];
             #pragma unroll
-            for (int j = 0; j < 4; ++j) { // split read: all 32 banks, no conflict
+            for (int j = 0; j < 4; ++j) {
                 regN[j]     = Bs[buf][kk*BN + threadCol*4 + j];
                 regN[4 + j] = Bs[buf][kk*BN + threadCol*4 + HN + j];
             }
@@ -630,7 +589,7 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
                 for (int j = 0; j < TN; ++j) acc[i][j] += regM[i] * regN[j];
         }
 
-        if (has_next) { // land the prefetched tile in the other buffer, then swap
+        if (has_next) {
             As[1-buf][(innerColA*4+0)*BM + innerRowA] = a_next.x;
             As[1-buf][(innerColA*4+1)*BM + innerRowA] = a_next.y;
             As[1-buf][(innerColA*4+2)*BM + innerRowA] = a_next.z;
@@ -641,8 +600,6 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
         }
     }
 
-    // Epilogue: acc[i][0..3] holds columns threadCol*4.., acc[i][4..7] the
-    // group HN further right. Two float4 stores per row, both 16B-aligned.
     #pragma unroll
     for (int i = 0; i < TM; ++i) {
         const int gRow = blockRow + threadRow * TM + i;
@@ -661,39 +618,21 @@ gemm_reg_v5_kernel(int M, int N, int K, float alpha,
     }
 }
 
-// v6: v5 + a warp tier between the block tile and the thread tile. v5 has no
-// warp level, so a warp (32 consecutive tids) spans threadRow over 2 values and
-// threadCol over 16: a 16x128 sliver of the block tile. Giving each warp a
-// 128x16 tile instead changes what a warp's 32 lanes read per k-step -- 16
-// distinct As rows and 2 distinct Bs column groups, against 2 and 16 before.
-// Same instruction count, but they coalesce into a third fewer wavefronts
-// (3.0 -> 2.0 per shared-load instruction, l1tex__data_pipe_lsu_wavefronts_mem_
-// shared_op_ld over smsp__inst_executed_op_shared_ld), where the ~4% comes from.
-//
-// Both tiles are read in groups of 4 (the float4 the hardware can serve in one
-// pass). Bs already was, since v5. As has to be too here: warp tiling makes its
-// read strided (16 rows 8 floats apart land on 4 banks, a 4-way conflict worth
-// 134M of them, measured) and the same split fixes it. That took the gain from
-// ~3% to ~5%. The elongated warp tile beating the square 64x32 one was not the
-// prediction; see the README.
-// The geometry is a template parameter because two of them ship. The 128x128
-// tile below is v6 as first written; a 256x128 tile with a 16x8 thread block
-// joins it, and the dispatch in gemm_cuda_v3 picks between them. Everything
-// else in the body is shared, so the two differ only in these numbers.
+// v6 adds a warp tier, each warp owning a 128x16 tile, which cuts the shared
+// memory wavefronts per k-step. The geometry is a template parameter so 128x128
+// and 256x128 can both ship.
 template <int BM, int BN, int WM, int WN, int TM, int TN, int MIN_BLOCKS>
 __global__ void __launch_bounds__((BM*BN)/(TM*TN), MIN_BLOCKS)
 gemm_reg_v6_kernel(int M, int N, int K, float alpha,
                    const float* __restrict__ A, const float* __restrict__ B,
                    float beta, float* __restrict__ C) {
     constexpr int BK = 8;
-    constexpr int NT     = (BM * BN) / (TM * TN);   // threads per block
-    constexpr int WCOLS  = BN / WN;         // warps across N
-    constexpr int WSUB_N = WN / TN;         // threads of a warp across N
-    constexpr int GW = 4;                   // group width: one float4
-    constexpr int GN = TN / GW, SPN = WN / GN;  // Bs: groups and their spacing
-    constexpr int GM = TM / GW, SPM = WM / GM;  // As: idem
-    // Each thread stages A4 float4 of A and B4 of B. Both are 1 for 128x128,
-    // and A4 is 2 for 256x128: twice the rows, same thread count.
+    constexpr int NT     = (BM * BN) / (TM * TN);
+    constexpr int WCOLS  = BN / WN;
+    constexpr int WSUB_N = WN / TN;
+    constexpr int GW = 4;
+    constexpr int GN = TN / GW, SPN = WN / GN;
+    constexpr int GM = TM / GW, SPM = WM / GM;
     constexpr int A4 = (BM * BK / 4) / NT, AR = NT / (BK / 4);
     constexpr int B4 = (BK * BN / 4) / NT, BR = NT / (BN / 4);
 
@@ -702,7 +641,7 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
     static_assert(TM % 4 == 0 && TN % 4 == 0, "TM and TN must be float4 multiples");
     static_assert((BM*BK) % (4*NT) == 0 && (BK*BN) % (4*NT) == 0, "staging does not divide");
 
-    __shared__ float As[2][BK * BM];        // transposed: As[buf][k*BM + m]
+    __shared__ float As[2][BK * BM];
     __shared__ float Bs[2][BK * BN];
 
     const int blockRow = blockIdx.y * BM;
@@ -711,15 +650,14 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
     const int warp = tid / 32, lane = tid % 32;
     const int warpRow = (warp / WCOLS) * WM;
     const int warpCol = (warp % WCOLS) * WN;
-    const int rowBase = warpRow + (lane / WSUB_N) * GW;   // first row group
-    const int colBase = warpCol + (lane % WSUB_N) * GW;   // first column group
+    const int rowBase = warpRow + (lane / WSUB_N) * GW;
+    const int colBase = warpCol + (lane % WSUB_N) * GW;
     const int innerRowA = tid / (BK / 4), innerColA = tid % (BK / 4);
     const int innerRowB = tid / (BN / 4), innerColB = tid % (BN / 4);
 
     float acc[TM][TN] = {};
     float regM[TM], regN[TN];
 
-    // Prologue: stage tile 0 into buffer 0 (unchanged from v5).
     #pragma unroll
     for (int p = 0; p < A4; ++p) {
         const int rA = innerRowA + p * AR;
@@ -790,7 +728,6 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
         }
     }
 
-    // Epilogue: rows and columns both follow the group layout used above.
     #pragma unroll
     for (int t = 0; t < TM; ++t) {
         const int gRow = blockRow + rowBase + (t / GW) * SPM + (t % GW);
@@ -809,33 +746,19 @@ gemm_reg_v6_kernel(int M, int N, int K, float alpha,
     }
 }
 
-// The two shipped geometries. v6 is the original 128x128; v6_big trades half
-// the occupancy for twice the outputs per thread, which is cuBLAS's own choice
-// on this card (its kernel is cutlass_80_simt_sgemm_256x128_8x4). Per k-step a
-// thread there reads 16 A values and 8 of B for 128 FMAs, 21.3 FMAs per shared
-// load against 8x8's 16, so a quarter fewer shared-load instructions for the
-// same work. It costs 206 registers, hence one block per SM instead of two.
+// v6_big is the 256x128 tile cuBLAS picks on this card.
 #define GEMM_V6_SMALL 128, 128, 128, 16,  8, 8
 #define GEMM_V6_BIG   256, 128, 256, 16, 16, 8
 
 static bool v3_aligned(int M, int N, int K) { return M % 128 == 0 && N % 128 == 0 && K % 8 == 0; }
 
-// Wave quantization efficiency. The SM is the quantum, not the 2-blocks/SM
-// wave: the card runs `sm` blocks at a time, so the makespan is ceil(blocks/sm)
-// block-times while the work is blocks/sm. A grid that overruns by one block
-// pays a whole extra pass. Checked against measurement on 14 sizes: one
-// parameter, 13 of them inside 3% (the README has the table).
+// A grid pays for ceil(blocks/sm) full waves, see docs/wave-quantization.md.
 static double wave_efficiency(int blocks, int sm) {
     const double w = (double)blocks / sm;
     return w / std::ceil(w);
 }
 
-// Which of the two geometries to launch. The 256x128 tile has the better
-// arithmetic intensity, so it wins whenever it quantizes at least as well; when
-// it quantizes worse -- its grid is half the size, so it lands differently on
-// the SM count -- the lost wave costs more than the intensity gains. That rule
-// picked the faster kernel on 13 of 13 sizes where both apply, without timing
-// anything. It needs M % 256 == 0, so half the sizes fall back to 128x128.
+// 256x128 wins when it quantizes at least as well, and needs M % 256 == 0.
 static bool pick_big_tile(int M, int N, int sm) {
     if (M % 256 != 0) return false;
     const int small = (M / 128) * (N / 128);
@@ -845,8 +768,8 @@ static bool pick_big_tile(int M, int N, int sm) {
 
 void gemm_cuda_v3(int M, int N, int K, float alpha,
                   const float* A, const float* B, float beta, float* C) {
-    if (gemm_quick_return(M, N, K, beta, C)) return; // before v3_aligned: K==0 passes K%8==0
-    if (!v3_aligned(M, N, K)) { // unguarded float4 needs aligned tiles -> fall back to v2
+    if (gemm_quick_return(M, N, K, beta, C)) return; // before v3_aligned, since K==0 passes K%8==0
+    if (!v3_aligned(M, N, K)) {
         gemm_cuda_reg(M, N, K, alpha, A, B, beta, C);
         return;
     }
@@ -871,13 +794,7 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
         gemm_reg_v6_kernel<GEMM_V6_BIG, 1><<<dim3(N / 128, M / 256), 256>>>(
             M, N, K, alpha, dA, dB, beta, dC);
     } else {
-        // Pick the launch_bounds build from the grid, because neither wins
-        // everywhere. Both builds cost 128 registers here (the split addressing
-        // is cheaper than v3db's, so the kernel sits on the 2-blocks/SM cliff
-        // naturally), yet the hint still changes ptxas scheduling enough to
-        // measure: <1> is ~3.5 points of cuBLAS ahead at n=1024 (12/12 reps),
-        // <2> ~1 point ahead once the grid can seat 2 blocks/SM (11/12 reps).
-        // Same crossover as v4: 2 blocks/SM worth of grid.
+        // <1> while the grid cannot seat two blocks per SM, <2> once it can.
         const dim3 grid(N / 128, M / 128);
         if ((int)(grid.x * grid.y) >= 2 * smCount)
             gemm_reg_v6_kernel<GEMM_V6_SMALL, 2><<<grid, 256>>>(M, N, K, alpha, dA, dB, beta, dC);
@@ -891,11 +808,8 @@ void gemm_cuda_v3(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// cuBLAS SGEMM with this repo's row-major convention. cuBLAS is column-major;
-// the standard trick is to compute C^T = B^T * A^T: a row-major buffer read as
-// column-major IS the transpose, so passing (B, A) swapped with (N, M, K) and
-// leading dims (N, K, N) yields exactly our row-major C. No transpose kernels,
-// no copies. Same beta==0 write-only semantics as the rest of the repo.
+// cuBLAS is column-major. Passing (B, A) and (N, M, K) computes C^T = B^T*A^T,
+// which is C in row-major, with no copy.
 void gemm_cublas(int M, int N, int K, float alpha,
                  const float* A, const float* B, float beta, float* C) {
     if (gemm_quick_return(M, N, K, beta, C)) return;
@@ -909,7 +823,7 @@ void gemm_cublas(int M, int N, int K, float alpha,
     CUDA_CHECK(cudaMalloc(&dC, sc));
     CUDA_CHECK(cudaMemcpy(dA, A, sa, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dB, B, sb, cudaMemcpyHostToDevice));
-    if (beta != 0.0f) // beta==0: C is write-only (BLAS) -> skip the upload
+    if (beta != 0.0f)
         CUDA_CHECK(cudaMemcpy(dC, C, sc, cudaMemcpyHostToDevice));
 
     cublasHandle_t h;
@@ -923,32 +837,13 @@ void gemm_cublas(int M, int N, int K, float alpha,
     cudaFree(dA); cudaFree(dB); cudaFree(dC);
 }
 
-// v1, v2, v3 (float4), v3 (float4 + double buffering), v4 (the 128-register
-// launch_bounds build) and cuBLAS SGEMM, device timing, no transfers, all
-// back-to-back. Each kernel is measured over ~200 ms of work (iteration count
-// printed), not a fixed count -- see bench_timing.cuh. v3/v4 are timed only on
-// the aligned fast path.
 void benchmark_gemm_versions(int M, int N, int K) {
     const float alpha = 1.0f, beta = 0.0f;
     const size_t sa = (size_t)M * K * sizeof(float);
     const size_t sb = (size_t)K * N * sizeof(float);
     const size_t sc = (size_t)M * N * sizeof(float);
-    // Buffer rotation, per NVIDIA's GEMM measurement guidelines: with a single
-    // pair of input buffers, iteration i+1 finds A and B still in L2 from
-    // iteration i and reads a cache the timing then credits to the kernel.
-    //
-    // k collapses to 1, and the rotation to a no-op, as soon as A and B alone
-    // exceed twice the L2 -- from n = 1145 on this card, so only the small sizes
-    // ever allocate anything extra. C is not rotated: it is overwritten every
-    // iteration, so nothing carries over that would flatter the next one.
-    //
-    // Measured effect here: none. At n = 1024, the size the guideline flags, an
-    // alternated in-place A/B puts the rotation at -0.2% for v6 and +0.3% for
-    // cuBLAS, under the run-to-run spread. A GEMM moves 12 MB per launch against
-    // a 5 MB L2, so it has already evicted its own inputs before the next
-    // iteration starts. The rotation stays because it is free and because the
-    // guideline is the guideline, not because it changed a number. It does move
-    // the attention benchmark, by ~10%.
+    // Inputs rotate over twice the L2. C does not, every iteration overwrites
+    // it.
     const int k = bench::rotation_copies(sa + sb);
 
     std::vector<float*> dAs((size_t)k), dBs((size_t)k);
@@ -966,10 +861,8 @@ void benchmark_gemm_versions(int M, int N, int K) {
     dim3 b2(256), g2((N + BN - 1) / BN, (M + BM - 1) / BM);
     cublasHandle_t h;
     CUBLAS_CHECK(cublasCreate(&h));
-    dim3 g3v(N / BN, M / BM); // v3 fast path assumes aligned sizes
+    dim3 g3v(N / BN, M / BM);
     const bool v3ok = v3_aligned(M, N, K);
-    // Every kernel rotates, cuBLAS included: measuring the baseline on a warm
-    // cache and ours on a cold one would be worse than the original problem.
     auto A = [&](int i) { return dAs[i % k]; };
     auto B = [&](int i) { return dBs[i % k]; };
     auto run_v1 = [&](int i){ gemm_kernel<<<g1, b1>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
@@ -978,14 +871,12 @@ void benchmark_gemm_versions(int M, int N, int K) {
     auto run_cb = [&](int i){ CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N,
                                                 N, M, K, &alpha, B(i), N, A(i), K, &beta, dC, N)); };
 
-    // Warm-up (the first cuBLAS call also pays its workspace init).
     auto run_v3db = [&](int i){ gemm_reg_v3db_kernel<1><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
     auto run_v4   = [&](int i){ gemm_reg_v3db_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
     auto run_v5   = [&](int i){ gemm_reg_v5_kernel<1><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
     auto run_v5lb = [&](int i){ gemm_reg_v5_kernel<2><<<g3v, b2>>>(M, N, K, alpha, A(i), B(i), beta, dC); };
-    // v6 goes through the same dispatch as gemm_cuda_v3, otherwise the benchmark
-    // reports a kernel the API does not launch. `big` is fixed per shape, so the
-    // branch costs nothing inside the timed loop.
+    // v6 goes through gemm_cuda_v3's dispatch, so the bench times what the API
+    // launches.
     int smCount = 0, bdev = 0;
     CUDA_CHECK(cudaGetDevice(&bdev));
     CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, bdev));

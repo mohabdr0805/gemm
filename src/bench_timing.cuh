@@ -7,7 +7,7 @@
 // Shared timing helper: runs `run` for ~200 ms and returns ms/iter, so every
 // kernel is measured over the same window whatever its speed. A fixed count is
 // too few for fast kernels (launch overhead) and too many for slow ones (clock
-// drift under the next kernel); the README methodology note has the numbers.
+// drift under the next kernel); docs/methodology.md has the numbers.
 namespace gemm {
 namespace bench {
 

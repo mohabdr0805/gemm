@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
 
     // Softmax (row-wise): memory-bound, so the figure of merit is bandwidth. The
     // 8192 row is fixed rather than derived from `n`: the online kernel only
-    // separates from the 3-pass one above the L2 crossover, n* ~ 3200 (README).
+    // separates from the 3-pass one above the L2 crossover, n* ~ 3200 (docs/attention.md).
     std::printf("\n[Softmax row-wise]  device timing (no transfers)\n");
     gemm::benchmark_softmax(n, n);
     gemm::benchmark_softmax(n, 1024);
@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
     // Attention (FlashAttention-style): fused scores + softmax + P*V in one pass,
     // never materializing the n x n score matrix. v1 (one query row per block) vs
     // v2 (query tiling: K/V reused across the block's rows). Both head dims from
-    // the README table: 64 (register-resident) and 128 (spills, smaller gain).
+    // the table in docs/attention.md: 64 (register-resident) and 128 (spills, smaller gain).
     std::printf("\n[Attention FlashAttention-style]  v1 vs v2, device timing (no transfers)\n");
     for (int d : { 64, 128 }) {
         std::printf("d=%d:\n", d);

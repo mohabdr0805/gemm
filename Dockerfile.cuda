@@ -1,6 +1,5 @@
-# CUDA build of gemm-optim: GEMM kernels (v1 shared-mem, v2 register-tiled),
-# the fused bias+activation epilogue, row-wise softmax, and the
-# FlashAttention-style attention kernels (v1 + query-tiled v2).
+# CUDA build of gemm-optim: GEMM kernels v1 to v6, the fused bias+activation
+# epilogue, row-wise softmax, and the attention kernels (v1, v2, FA-2, v3).
 # Compiles the CUDA code; running the GPU tests/benchmark needs an NVIDIA GPU and
 # the NVIDIA Container Toolkit on the host:
 #   docker build -f Dockerfile.cuda -t gemm-cuda .

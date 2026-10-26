@@ -1,10 +1,6 @@
-// FlashAttention-style attention on the GPU: O = softmax(scale * Q*K^T) * V,
-// row-major, one head. The N x N score matrix is never materialized -- each
-// query row (one block) streams the keys in tiles of ATTN_BC, carrying a running
-// softmax (running max m, running normalizer l, running output accumulator acc)
-// that is rescaled whenever a new tile raises the max. That online-softmax trick
-// is what lets the whole thing -- scores, softmax and the P*V product -- run in a
-// single fused pass with O(N*d) extra memory instead of O(N*N).
+// FlashAttention, O = softmax(scale * Q*K^T) * V for one head. The N x N score
+// matrix is never stored, a running max and sum are rescaled tile by tile.
+
 #include "gemm/attention_cuda.cuh"
 #include "bench_timing.cuh"
 
@@ -13,20 +9,18 @@
 #include <cstdlib>
 #include <cfloat>
 #include <cmath>
-#include <vector>  // the benchmark's rotated input buffers
+#include <vector>
 
-#define ATTN_THREADS 128 // threads per block (one block handles one query row)
-#define ATTN_BC      32  // key tile width (power of two: tree reductions below)
-#define ATTN_DMAX    128 // max head dimension supported (shared-memory budget)
+#define ATTN_THREADS 128
+#define ATTN_BC      32
+#define ATTN_DMAX    128
 
-#define ATTN2_BR     64  // v2: query rows per block (== threads per block)
-#define ATTN2_BC     32  // v2: key tile width
+#define ATTN2_BR     64
+#define ATTN2_BC     32
 
-#define ATTN_FA2_WPB 8   // FA-2: warps per block (== query rows per block, one warp/row)
-#define ATTN_FA2_BC  32  // FA-2: key tile width
+#define ATTN_FA2_WPB 8
+#define ATTN_FA2_BC  32
 
-// Same abort-on-error helper as the other .cu files (kept local so this kernel
-// is self-contained).
 #define CUDA_CHECK(call)                                                  \
     do {                                                                  \
         cudaError_t err = (call);                                         \
@@ -39,43 +33,36 @@
 
 namespace gemm {
 
-// One block per query row. d is a runtime value, capped at ATTN_DMAX so the
-// shared tiles can be sized at compile time. Ks/Vs rows are padded to
-// [ATTN_BC][ATTN_DMAX+1]: the odd stride gives the per-key dot product (threads
-// walking different rows at the same column) distinct banks -- the same
-// bank-conflict dodge as the GEMM tiles.
+// One block per query row. The +1 padding puts the score loop on distinct
+// banks.
 __global__ void flash_attention_kernel(int M, int N, int d, float scale,
                                        const float* __restrict__ Q,
                                        const float* __restrict__ K,
                                        const float* __restrict__ V,
                                        float* __restrict__ O, bool causal) {
-    const int i = blockIdx.x;       // query row
+    const int i = blockIdx.x;
     if (i >= M) return;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
 
-    __shared__ float q_sh[ATTN_DMAX];               // this row's query, reused for every key
-    __shared__ float acc [ATTN_DMAX];               // running (unnormalized) output
+    __shared__ float q_sh[ATTN_DMAX];
+    __shared__ float acc [ATTN_DMAX];
     __shared__ float Ks  [ATTN_BC][ATTN_DMAX + 1];
     __shared__ float Vs  [ATTN_BC][ATTN_DMAX + 1];
-    __shared__ float s_sh[ATTN_BC];                 // tile scores, reused for tile probs
-    __shared__ float red [ATTN_BC];                 // reduction scratch
-    __shared__ float m_sh, l_sh;                    // running max, running normalizer
+    __shared__ float s_sh[ATTN_BC];
+    __shared__ float red [ATTN_BC];
+    __shared__ float m_sh, l_sh;
 
-    // Load the query row and zero the accumulator / running stats.
     for (int t = tid; t < d; t += nthreads) { q_sh[t] = Q[(size_t)i * d + t]; acc[t] = 0.0f; }
     if (tid == 0) { m_sh = -FLT_MAX; l_sh = 0.0f; }
     __syncthreads();
 
-    // Causal: row i only attends to keys j <= i, so the key loop just stops at
-    // i+1. Whole tiles past the diagonal are never touched and the last tile is
-    // naturally truncated, so no per-element mask is needed.
+    // Causal rows stop at key i, so no mask is needed.
     const int nkeys = causal ? min(N, i + 1) : N;
 
     for (int j0 = 0; j0 < nkeys; j0 += ATTN_BC) {
-        const int tile = min(ATTN_BC, nkeys - j0); // valid keys in this tile
+        const int tile = min(ATTN_BC, nkeys - j0);
 
-        // 1) stage the K and V tiles in shared memory (coalesced over tile*d floats)
         for (int idx = tid; idx < tile * d; idx += nthreads) {
             const int c = idx / d, t = idx % d;
             Ks[c][t] = K[(size_t)(j0 + c) * d + t];
@@ -83,7 +70,6 @@ __global__ void flash_attention_kernel(int M, int N, int d, float scale,
         }
         __syncthreads();
 
-        // 2) scores s[c] = scale * <q, K[j0+c]>, one thread per key in the tile
         if (tid < tile) {
             float dot = 0.0f;
             for (int t = 0; t < d; ++t) dot += q_sh[t] * Ks[tid][t];
@@ -91,7 +77,6 @@ __global__ void flash_attention_kernel(int M, int N, int d, float scale,
         }
         __syncthreads();
 
-        // 3) tile max (lanes with no key are neutral -FLT_MAX)
         if (tid < ATTN_BC) red[tid] = (tid < tile) ? s_sh[tid] : -FLT_MAX;
         __syncthreads();
         for (int s = ATTN_BC >> 1; s > 0; s >>= 1) {
@@ -99,15 +84,12 @@ __global__ void flash_attention_kernel(int M, int N, int d, float scale,
             __syncthreads();
         }
         const float tile_max = red[0];
-        __syncthreads(); // all threads have read red[0] before step 4 reuses red[]
+        __syncthreads();
 
-        // The new running max, and the factor that rescales the old state to it.
-        // m_sh, tile_max and m_new are identical across the block, so corr is too.
         const float m_old = m_sh;
         const float m_new = fmaxf(m_old, tile_max);
-        const float corr  = expf(m_old - m_new); // first tile: m_old=-FLT_MAX -> 0
+        const float corr  = expf(m_old - m_new);
 
-        // 4) probs p[c] = exp(s[c]-m_new) (overwrite s_sh in place), then tile sum
         if (tid < tile) s_sh[tid] = expf(s_sh[tid] - m_new);
         __syncthreads();
         if (tid < ATTN_BC) red[tid] = (tid < tile) ? s_sh[tid] : 0.0f;
@@ -118,19 +100,15 @@ __global__ void flash_attention_kernel(int M, int N, int d, float scale,
         }
         const float tile_sum = red[0];
 
-        // 5) fold the tile into the running softmax: rescale the old normalizer
-        //    and accumulator by corr (so they are expressed relative to the new
-        //    max), then add this tile's contribution.
         if (tid == 0) { l_sh = l_sh * corr + tile_sum; m_sh = m_new; }
         for (int t = tid; t < d; t += nthreads) {
             float a = acc[t] * corr;
             for (int c = 0; c < tile; ++c) a += s_sh[c] * Vs[c][t];
             acc[t] = a;
         }
-        __syncthreads(); // tile done; the next iteration overwrites Ks/Vs/s_sh
+        __syncthreads();
     }
 
-    // Normalize once at the end: O[i] = acc / l.
     const float inv = 1.0f / l_sh;
     for (int t = tid; t < d; t += nthreads) O[(size_t)i * d + t] = acc[t] * inv;
 }
@@ -164,12 +142,8 @@ void flash_attention_cuda(int M, int N, int d, float scale,
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
 }
 
-// ---------------------------------------------------------------------------
-// v2: query tiling. A block owns a *tile* of ATTN2_BR query rows that share each
-// streamed K/V tile, cutting K/V reads from M to M/ATTN2_BR (the v1->v2 move of
-// the GEMM kernels). One thread per row keeps its (m, l) and acc[D] in registers,
-// so rows are independent. D is a template parameter (loops unroll); q/acc spill
-// at D=128 (~1 KB/thread), where v2 still beats v1 by a smaller margin.
+// v2 shares each K/V tile between ATTN2_BR rows, one thread per row with its
+// state in registers. q and acc spill at D=128.
 template <int D>
 __global__ void flash_attention_v2_kernel(int M, int N, float scale,
                                           const float* __restrict__ Q,
@@ -177,13 +151,11 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
                                           const float* __restrict__ V,
                                           float* __restrict__ O, bool causal) {
     constexpr int BR = ATTN2_BR, BC = ATTN2_BC;
-    // [D+1] pads the row stride for the cooperative load; the per-score read is a
-    // broadcast (all rows read the same Ks[c][t]), so it needs no padding itself.
     __shared__ float Ks[BC][D + 1];
     __shared__ float Vs[BC][D + 1];
 
-    const int r = threadIdx.x;             // query row within the block
-    const int i = blockIdx.x * BR + r;     // global query row
+    const int r = threadIdx.x;
+    const int i = blockIdx.x * BR + r;
     const bool active = (i < M);
     const int nthreads = blockDim.x;
 
@@ -191,16 +163,14 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
     #pragma unroll
     for (int t = 0; t < D; ++t) { q[t] = active ? Q[(size_t)i * D + t] : 0.0f; acc[t] = 0.0f; }
     float m = -FLT_MAX, l = 0.0f;
-    const int nkeys_i = causal ? min(N, i + 1) : N; // this row's own key limit
+    const int nkeys_i = causal ? min(N, i + 1) : N;
 
-    // The block streams keys up to the furthest any of its rows needs (the last
-    // row for the causal case); each row then stops at its own nkeys_i.
     const int nkeys_block = causal ? min(N, min(blockIdx.x * BR + BR, M)) : N;
 
     for (int j0 = 0; j0 < nkeys_block; j0 += BC) {
         const int tile = min(BC, N - j0);
 
-        // Cooperative load of the K/V tile (all threads, including inactive ones).
+        // every thread loads the tile, inactive rows included
         for (int idx = r; idx < tile * D; idx += nthreads) {
             const int c = idx / D, t = idx % D;
             Ks[c][t] = K[(size_t)(j0 + c) * D + t];
@@ -209,13 +179,12 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
         __syncthreads();
 
         if (active) {
-            // This row's scores for the tile (kept in registers), and the tile max.
             float s[BC];
             float tile_max = -FLT_MAX;
             int cnt = 0;
             #pragma unroll
             for (int c = 0; c < BC; ++c) {
-                if (c >= tile || j0 + c >= nkeys_i) break; // physical end / causal end
+                if (c >= tile || j0 + c >= nkeys_i) break;
                 float dot = 0.0f;
                 #pragma unroll
                 for (int t = 0; t < D; ++t) dot += q[t] * Ks[c][t];
@@ -224,7 +193,6 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
                 cnt = c + 1;
             }
             if (cnt > 0) {
-                // Fold the tile in with a single rescale (per tile, not per key).
                 const float m_new = fmaxf(m, tile_max);
                 const float corr  = expf(m - m_new);
                 l *= corr;
@@ -241,7 +209,7 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
                 m = m_new;
             }
         }
-        __syncthreads(); // before the next tile overwrites Ks/Vs
+        __syncthreads();
     }
 
     if (active) {
@@ -251,14 +219,9 @@ __global__ void flash_attention_v2_kernel(int M, int N, float scale,
     }
 }
 
-// ---------------------------------------------------------------------------
-// FA-2-style: a whole warp owns one query row, splitting D across its 32 lanes
-// (lane l owns dims l, l+32, ...), so at D=128 each lane holds 4 elements of
-// q/acc and never spills -- fixing v2's D=128 register spill. The cost: the score
-// <q,k> is a sum over D, now split across lanes, so a warp butterfly (__shfl_xor,
-// registers) recombines the 32 partials. That is the only cross-lane step; (m, l)
-// are per-row and P*V is per-lane. Requires D % 32 == 0; a block is ATTN_FA2_WPB
-// warps sharing each K/V tile.
+// FA-2 gives each row a warp and splits D across the lanes, so nothing spills
+// at D=128. A __shfl_xor butterfly rebuilds each score from the 32 partial
+// sums.
 template <int D>
 __global__ void flash_attention_fa2_kernel(int M, int N, float scale,
                                            const float* __restrict__ Q,
@@ -266,20 +229,19 @@ __global__ void flash_attention_fa2_kernel(int M, int N, float scale,
                                            const float* __restrict__ V,
                                            float* __restrict__ O, bool causal) {
     constexpr int WPB = ATTN_FA2_WPB, BC = ATTN_FA2_BC;
-    constexpr int DL  = D / 32;   // head-dim elements owned by each lane
-    constexpr int BR  = WPB;      // query rows per block (one warp each)
+    constexpr int DL  = D / 32;
+    constexpr int BR  = WPB;
 
-    __shared__ float Ks[BC][D];   // score/PV reads are stride-1 across lanes -> no bank conflict
+    __shared__ float Ks[BC][D];
     __shared__ float Vs[BC][D];
 
     const int tid  = threadIdx.x;
-    const int lane = tid & 31;    // 0..31 : which slice of D this thread owns
-    const int warp = tid >> 5;    // 0..WPB-1 : which query row in the block
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
     const int nthreads = blockDim.x;
-    const int i = blockIdx.x * BR + warp;   // global query row (warp-uniform)
+    const int i = blockIdx.x * BR + warp;
     const bool active = (i < M);
 
-    // Per-lane slice of the query and accumulator: DL elements, dims lane+32*k.
     float q[DL], acc[DL];
     #pragma unroll
     for (int k = 0; k < DL; ++k) {
@@ -294,7 +256,6 @@ __global__ void flash_attention_fa2_kernel(int M, int N, float scale,
     for (int j0 = 0; j0 < nkeys_block; j0 += BC) {
         const int tile = min(BC, N - j0);
 
-        // Cooperative load of the K/V tile (all threads, all warps share it).
         for (int idx = tid; idx < tile * D; idx += nthreads) {
             const int c = idx / D, t = idx % D;
             Ks[c][t] = K[(size_t)(j0 + c) * D + t];
@@ -308,12 +269,10 @@ __global__ void flash_attention_fa2_kernel(int M, int N, float scale,
             int cnt = 0;
             #pragma unroll
             for (int c = 0; c < BC; ++c) {
-                if (c >= tile || j0 + c >= nkeys_i) break; // warp-uniform: no divergent shuffle
-                // (1) each lane's partial dot over its DL dims...
+                if (c >= tile || j0 + c >= nkeys_i) break; // warp-uniform break, no lane misses the shuffle
                 float partial = 0.0f;
                 #pragma unroll
                 for (int k = 0; k < DL; ++k) partial += q[k] * Ks[c][lane + k * 32];
-                // (2) ...butterfly-reduced across the 32 lanes -> full score in every lane.
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1)
                     partial += __shfl_xor_sync(0xffffffff, partial, off);
@@ -332,14 +291,13 @@ __global__ void flash_attention_fa2_kernel(int M, int N, float scale,
                     if (c >= cnt) break;
                     const float p = expf(s[c] - m_new);
                     l += p;
-                    // (3) P*V: each lane accumulates only ITS output dims -- no cross-lane.
                     #pragma unroll
                     for (int k = 0; k < DL; ++k) acc[k] += p * Vs[c][lane + k * 32];
                 }
                 m = m_new;
             }
         }
-        __syncthreads(); // before the next tile overwrites Ks/Vs
+        __syncthreads();
     }
 
     if (active) {
@@ -349,7 +307,7 @@ __global__ void flash_attention_fa2_kernel(int M, int N, float scale,
     }
 }
 
-// v2 only specializes the common head dims; anything else falls back to v1.
+// Only d = 32, 64 and 128 have v2 and FA-2 kernels, other d fall back to v1.
 static bool v2_supports(int d) { return d == 32 || d == 64 || d == 128; }
 
 static void launch_v2(dim3 grid, dim3 block, int M, int N, int d, float scale,
@@ -359,7 +317,7 @@ static void launch_v2(dim3 grid, dim3 block, int M, int N, int d, float scale,
         case 32:  flash_attention_v2_kernel<32> <<<grid, block>>>(M, N, scale, dQ, dK, dV, dO, causal); break;
         case 64:  flash_attention_v2_kernel<64> <<<grid, block>>>(M, N, scale, dQ, dK, dV, dO, causal); break;
         case 128: flash_attention_v2_kernel<128><<<grid, block>>>(M, N, scale, dQ, dK, dV, dO, causal); break;
-        default: // callers gate on v2_supports(d); this is a hard backstop
+        default:
             std::fprintf(stderr, "launch_v2: unsupported head dim d=%d (expected 32/64/128)\n", d);
             std::abort();
     }
@@ -369,7 +327,7 @@ void flash_attention_cuda_v2(int M, int N, int d, float scale,
                              const float* Q, const float* K, const float* V,
                              float* O, bool causal) {
     if (M <= 0 || N <= 0 || d <= 0) return;
-    if (!v2_supports(d)) { // no specialized kernel for this head dim -> use v1
+    if (!v2_supports(d)) {
         flash_attention_cuda(M, N, d, scale, Q, K, V, O, causal);
         return;
     }
@@ -395,7 +353,6 @@ void flash_attention_cuda_v2(int M, int N, int d, float scale,
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
 }
 
-// FA-2 supports the same specialized head dims as v2 (all multiples of 32).
 static void launch_fa2(dim3 grid, dim3 block, int M, int N, int d, float scale,
                        const float* dQ, const float* dK, const float* dV,
                        float* dO, bool causal) {
@@ -413,7 +370,7 @@ void flash_attention_cuda_fa2(int M, int N, int d, float scale,
                               const float* Q, const float* K, const float* V,
                               float* O, bool causal) {
     if (M <= 0 || N <= 0 || d <= 0) return;
-    if (!v2_supports(d)) { // no FA-2 kernel for this head dim -> reuse v2's own fallback chain
+    if (!v2_supports(d)) {
         flash_attention_cuda_v2(M, N, d, scale, Q, K, V, O, causal);
         return;
     }
@@ -439,19 +396,12 @@ void flash_attention_cuda_fa2(int M, int N, int d, float scale,
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO);
 }
 
-// v1 vs v2, device timing, no transfers -> the pure kernel speedup from query
-// tiling. Only meaningful when v2 has a specialized kernel for d (else both run
-// v1); the caller uses d in {32,64,128}.
 void benchmark_attention_versions(int M, int N, int d, bool causal) {
-    if (M <= 0 || N <= 0 || !v2_supports(d)) return; // v2 only times its specialized dims
+    if (M <= 0 || N <= 0 || !v2_supports(d)) return;
     const size_t sq  = (size_t)M * d * sizeof(float);
     const size_t skv = (size_t)N * d * sizeof(float);
 
-    // Rotated inputs. Attention is the benchmark this matters for: at n=4096,
-    // d=64, Q+K+V is 3 MB against a 5 MB L2, so without rotation every iteration
-    // reads a fully cached working set. Measured cost of the rotation here:
-    // ~10%, at both n=1024 and n=4096, 6 alternated rounds out of 6. GEMM by
-    // contrast moves by ~0 (see the README methodology note).
+    // Inputs rotate because Q, K and V fit in the L2 (see bench_timing.cuh).
     const int k = bench::rotation_copies(sq + 2 * skv);
     std::vector<float*> dQs(k), dKs(k), dVs(k);
     for (int i = 0; i < k; ++i) {
@@ -462,7 +412,7 @@ void benchmark_attention_versions(int M, int N, int d, bool causal) {
         CUDA_CHECK(cudaMemset(dKs[i], 0, skv));
         CUDA_CHECK(cudaMemset(dVs[i], 0, skv));
     }
-    float* dO; // not rotated: rewritten every iteration anyway
+    float* dO;
     CUDA_CHECK(cudaMalloc(&dO, sq));
 
     const float scale = 1.0f / std::sqrt((float)d);
@@ -474,8 +424,8 @@ void benchmark_attention_versions(int M, int N, int d, bool causal) {
     const double t1 = bench::ms_per_iter(run_v1, &it1);
     const double t2 = bench::ms_per_iter(run_v2, &it2);
 
-    double gflop = 4.0 * (double)M * N * d / 1e9; // Q*K^T and P*V, 2*M*N*d each
-    if (causal) gflop *= 0.5;                      // ~half masked (exact for M==N)
+    double gflop = 4.0 * (double)M * N * d / 1e9;
+    if (causal) gflop *= 0.5;
     std::printf("  v1 one-row/block   %s : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n",
                 causal ? "causal" : "full  ", t1, gflop / (t1 / 1e3), it1);
     std::printf("  v2 query-tiled     %s : %7.3f ms/iter   %7.2f GFLOP/s  [%4d it]\n",
@@ -486,15 +436,12 @@ void benchmark_attention_versions(int M, int N, int d, bool causal) {
     cudaFree(dO);
 }
 
-// v2 (one thread per row) vs FA-2 (one warp per row, head dim split across lanes),
-// device timing, no transfers. The question this answers: does FA-2's spill-free
-// register footprint at d=128 outweigh v2's higher K/V reuse? d in {32,64,128}.
 void benchmark_attention_fa2(int M, int N, int d, bool causal) {
     if (M <= 0 || N <= 0 || !v2_supports(d)) return;
     const size_t sq  = (size_t)M * d * sizeof(float);
     const size_t skv = (size_t)N * d * sizeof(float);
 
-    const int k = bench::rotation_copies(sq + 2 * skv); // same reason as above
+    const int k = bench::rotation_copies(sq + 2 * skv);
     std::vector<float*> dQs(k), dKs(k), dVs(k);
     for (int i = 0; i < k; ++i) {
         CUDA_CHECK(cudaMalloc(&dQs[i], sq));
@@ -531,55 +478,23 @@ void benchmark_attention_fa2(int M, int N, int d, bool causal) {
 
 } // namespace gemm
 
-// ---------------------------------------------------------------------------
-// v3: register micro-tiling -- the v1 -> v2 move of the GEMM, carried over
-// ---------------------------------------------------------------------------
-//
-// What the profiler said about the two kernels above, and why this exists.
-//
-//   v2, one thread per query row: 67.7 % of its SASS is FFMA, which is a good
-//   mix, but its parallelism is exactly M threads. At M=4096 that is 0.24 waves
-//   per SM, two active warps, 80 % of cycles with nothing eligible. Handing it a
-//   full grid lifts it from 4.2 % to 14.1 % of peak and no further, because two
-//   things still cap it: 218 registers per thread, so four blocks of two warps
-//   per SM, and a dependent FFMA chain of length D inside the score loop that
-//   float semantics forbid ptxas from splitting.
-//
-//   fa2, one warp per row: fills the machine and issues at half the peak rate,
-//   yet only 12.4 % of its instructions are FFMA. Splitting a row across 32
-//   lanes divides the multiply-adds by 32 and not the exponentials -- after the
-//   shuffle reduction all 32 lanes hold the same score and every one of them
-//   calls expf, so the FMA-to-exp ratio falls from 128:1 to 4:1.
-//
-// The two are equally far from peak for opposite reasons, and neither is fixed
-// by sliding along that cursor. This kernel takes the middle: a thread owns a
-// TM x TN block of the score tile and a TM x TD block of the output, so
-//
-//   * the accumulators are independent -- 16 scores and 32 outputs in flight --
-//     which is instruction-level parallelism standing in for the occupancy v2
-//     cannot have, the same argument as v2/v3 on the GEMM side of this repo;
-//   * every shared value loaded feeds TM or TN multiply-adds instead of one;
-//   * the exponential stays at one per (row, key), keeping v2's 128:1 ratio
-//     rather than fa2's 4:1.
-//
-// Per K/V tile: score micro-tile GEMM into registers, scores to shared, row max
-// and row sum, rescale, output micro-tile GEMM. The score buffer aliases the K
-// buffer, dead by that point, to stay inside the shared budget.
-#define ATTN3_BR      64   // query rows per block
-#define ATTN3_BC      32   // keys per streamed tile
-#define ATTN3_THREADS 128  // 4 warps, one per scheduler
+// v3 gives each thread a 4x4 block of scores, so the dot product stays in the
+// thread and each exp is computed once. v2 lacked threads and FA-2 recomputed
+// the exp in all 32 lanes (docs/attention.md).
+#define ATTN3_BR      64
+#define ATTN3_BC      32
+#define ATTN3_THREADS 128
 
 namespace {
 
-// Laid out by hand: the tile sizes depend on D, static __shared__ caps at 48 KB,
-// and D=128 needs more than that.
+// Laid out by hand because D=128 needs more than 48 KB of shared memory.
 struct V3Shared {
-    float* Qs;   // [BR][D+1]  loaded once per block
-    float* Vs;   // [BC][D+1]  per tile
-    float* KP;   // [BC][D+1] as K, then [BR][BC+1] as P
-    float* mrow; // [BR] running max
-    float* lrow; // [BR] running normaliser
-    float* crow; // [BR] this tile's rescale factor
+    float* Qs;
+    float* Vs;
+    float* KP;   // K, then P once the scores are done
+    float* mrow;
+    float* lrow;
+    float* crow;
 };
 
 __device__ __host__ inline int v3_kp_floats(int D) {
@@ -615,11 +530,11 @@ __global__ void flash_attention_v3_kernel(int M, int N, float scale,
                                           const float* __restrict__ V,
                                           float* __restrict__ O, bool causal) {
     constexpr int BR = ATTN3_BR, BC = ATTN3_BC, NT = ATTN3_THREADS;
-    constexpr int TM = 4, TN = 4;          // score micro-tile, 16 per thread
-    constexpr int RG = BR / TM;            // 16 row groups
-    constexpr int CG = BC / TN;            // 8 key groups, RG * CG == NT
-    constexpr int DG = NT / RG;            // 8 column groups for the output
-    constexpr int TD = D / DG;             // output micro-tile, TM x TD
+    constexpr int TM = 4, TN = 4;
+    constexpr int RG = BR / TM;
+    constexpr int CG = BC / TN;
+    constexpr int DG = NT / RG;
+    constexpr int TD = D / DG;
 
     extern __shared__ float raw[];
     V3Shared sh = v3_layout(raw, D);
@@ -627,11 +542,9 @@ __global__ void flash_attention_v3_kernel(int M, int N, float scale,
     const int tid = threadIdx.x;
     const int row0 = blockIdx.x * BR;
 
-    const int sr = tid / CG, sc = tid % CG;   // scores: rows sr*TM.., keys sc*TN..
+    const int sr = tid / CG, sc = tid % CG;
     const int orow = tid / DG, ocol = tid % DG;
 
-    // Q into shared once: every key tile re-reads it, and during the score GEMM
-    // a thread needs rows it does not own.
     for (int idx = tid; idx < BR * D; idx += NT) {
         const int r = idx / D, t = idx % D;
         sh.Qs[r * (D + 1) + t] = (row0 + r < M) ? Q[(size_t)(row0 + r) * D + t] : 0.0f;
@@ -675,7 +588,7 @@ __global__ void flash_attention_v3_kernel(int M, int N, float scale,
                 #pragma unroll
                 for (int n = 0; n < TN; ++n) s[m][n] += a[m] * b[n];
         }
-        __syncthreads();   // K is dead here; the buffer becomes P
+        __syncthreads();   // K is dead, the buffer becomes P
 
         #pragma unroll
         for (int m = 0; m < TM; ++m) {
@@ -689,9 +602,6 @@ __global__ void flash_attention_v3_kernel(int M, int N, float scale,
         }
         __syncthreads();
 
-        // Row max, rescale, exp, row sum. SUB threads per row, reduced over
-        // adjacent lanes. The exponential is evaluated once per (row, key) --
-        // the ratio fa2 gives up.
         {
             constexpr int SUB = NT / BR;
             constexpr int PER = BC / SUB;
@@ -805,18 +715,8 @@ void flash_attention_cuda_v3(int M, int N, int d, float scale,
 
 } // namespace gemm
 
-// --- C entry points, device pointers, no allocation and no transfer ----------
-//
-// The public flash_attention_cuda* functions above own their memory: they
-// cudaMalloc, copy the inputs in, launch, and copy back. That is the right shape
-// for a caller that has host data, and the wrong shape for a benchmark -- timing
-// them would time three allocations and four transfers around the kernel.
-// benchmark_attention_versions avoids that by launching the kernels directly on
-// buffers it allocated once, which is what these wrappers expose.
-//
-// They exist so a Python process can time these kernels against another
-// library's on the SAME buffers in the SAME process, which is the only way two
-// numbers are comparable here.
+// C entry points on device pointers, so Python can time the kernels on its own
+// buffers without allocation or copies.
 #if defined(_WIN32)
 #  define GEMM_API extern "C" __declspec(dllexport)
 #else
@@ -856,8 +756,8 @@ GEMM_API int gemm_attn_l2_bytes(void) {
     return p.l2CacheSize;
 }
 
-// Grid/block actually launched, so the harness can report occupancy rather than
-// assume it. Returns blocks; *threads gets the block size.
+// Returns the blocks launched and sets *threads, so occupancy is read, not
+// assumed.
 GEMM_API int gemm_attn_launch_shape(int which, int M, int* threads) {
     if (which == 1) { *threads = ATTN_THREADS; return M; }
     if (which == 2) { *threads = ATTN2_BR; return (M + ATTN2_BR - 1) / ATTN2_BR; }

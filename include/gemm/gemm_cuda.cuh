@@ -1,56 +1,37 @@
 #pragma once
 #include "gemm/activation.hpp"
 
-// GEMM on the GPU (CUDA). Same conventions as gemm_cpu.hpp:
-// row-major, A (MxK), B (KxN), C (MxN), C = alpha*A*B + beta*C.
-// No CUDA dependency here -> this header is also included from host code
-// (tests, bench) compiled by g++/cl, without nvcc.
+// GEMM on the GPU, C = alpha*A*B + beta*C, row-major like gemm_cpu.hpp. The
+// header has no CUDA types, so host code compiles it without nvcc.
 namespace gemm {
 
-// Base GEMM, v1 (shared-memory tiled kernel).
+// v1 tiles A and B in shared memory.
 void gemm_cuda(int M, int N, int K, float alpha,
                const float* A, const float* B, float beta, float* C);
 
-// GEMM v2 (register tiled): each thread computes an 8x8 micro-block of C in
-// registers -> higher arithmetic intensity. Same convention, same result.
+// v2 keeps an 8x8 block of C in registers per thread.
 void gemm_cuda_reg(int M, int N, int K, float alpha,
                    const float* A, const float* B, float beta, float* C);
 
-// GEMM v3+ (currently ships v6): v2 + float4 vectorized global loads, a
-// transposed As tile, double buffering (the next K-tile's loads are in flight
-// while the current tile computes), conflict-free reads of both shared tiles
-// (each thread's rows and columns split into groups of 4, so a warp's reads
-// cover all 32 banks), and a warp tier between the block tile and the thread
-// tile. Picks its __launch_bounds__ build from the grid size. Fast path for
-// M,N % 128 == 0 and K % 8 == 0; other shapes fall back to v2. Same result.
+// The fast kernel, v6 today. M and N must be multiples of 128 and K of 8,
+// otherwise it falls back to v2.
 void gemm_cuda_v3(int M, int N, int K, float alpha,
                   const float* A, const float* B, float beta, float* C);
 
-// cuBLAS SGEMM baseline, same row-major convention (internally computes
-// C^T = B^T * A^T in cuBLAS's column-major world -- the standard swap). Same
-// beta==0 write-only semantics. Validated against the naive oracle like every
-// other kernel; used by the benchmark as the vendor reference.
+// cuBLAS SGEMM with the same row-major convention, the benchmark's reference.
 void gemm_cublas(int M, int N, int K, float alpha,
                  const float* A, const float* B, float beta, float* C);
 
-// Device-timed comparison of the whole ladder -- v1 (shared-memory tiled), v2
-// (register tiled), v3 (float4, then float4 + double buffering), v4 (the
-// launch_bounds build of v3), v5 (conflict-free Bs reads, both builds), v6
-// (warp-tiled) -- and cuBLAS SGEMM, all back-to-back in the same power state.
-// v3..v6 are timed only on the aligned fast path.
+// Times v1 to v6 and cuBLAS back to back on the device.
 void benchmark_gemm_versions(int M, int N, int K);
 
-// Fused inference epilogue: C = act( alpha*A*B + beta*C + bias[col] ).
-// The bias add and the activation are computed in the GEMM kernel's epilogue ->
-// a single global-memory pass, a single launch (vs GEMM then a separate
-// element-wise kernel). bias: length-N vector, or nullptr.
+// C = act(alpha*A*B + beta*C + bias[col]) in one launch. bias has length N, or
+// is nullptr.
 void gemm_bias_act_cuda(int M, int N, int K, float alpha,
                         const float* A, const float* B, float beta, float* C,
                         const float* bias, Activation act);
 
-// Measures (device timing, no transfers) the gain from fusion: compares the
-// fused kernel to the two-pass path (GEMM + separate bias/activation kernel).
-// Prints both times and the speedup.
+// Times the fused kernel against GEMM followed by a separate bias/activation pass.
 void benchmark_fusion(int M, int N, int K, Activation act);
 
 } // namespace gemm
