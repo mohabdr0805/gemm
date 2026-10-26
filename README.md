@@ -2,10 +2,11 @@
 
 ![CI](https://github.com/mohabdr0805/gemm/actions/workflows/ci.yml/badge.svg)
 
-> **TL;DR**: hand-written CUDA SGEMM at **102.4% of cuBLAS SGEMM** on the
+> **TL;DR**: hand-written CUDA SGEMM at **106.7% of cuBLAS SGEMM** on the
 > geometric mean of 25 square aligned sizes from n=1024 to 4096, ahead of it on
-> 15 of them, spread 86% to 124%. The low end is wave quantization, modelled
-> below. Plus a FlashAttention-style attention kernel, up to ~8.4× from query
+> 21, with a Stream-K kept in [`experiments/stream-k/`](experiments/stream-k/).
+> Without it the library kernel is at 102.4%, ahead on 15, and its low end is
+> wave quantization, modelled below. Plus a FlashAttention-style attention kernel, up to ~8.4× from query
 > tiling. Every step was chosen from a Nsight Compute profile, every kernel is
 > checked against a CPU oracle, and device figures come from an RTX 3080, ~200 ms
 > of work per kernel, cuBLAS timed in the same run.
@@ -60,9 +61,10 @@ Each step in detail is in [`docs/gemm.md`](docs/gemm.md).
 | + | a second tile, 256×128, picked per size by the quantization model | the faster of the two on 13 of 13 sizes, without timing them |
 | v7 | both tiles staged with `cp.async`, A transposed by 4-byte copies, BK=16 on 3 stages, the next fragments read a step ahead, cuBLAS's FFMA order | from 93.7% to 98.8% at n=4096, +2 points on the 25-size mean, in the same runs |
 
-A hybrid Stream-K on v7's last wave reaches 106.6% on the mean and 102.7% at
-n=4096, but it needs a workspace and a second kernel, so it does not ship, and
-neither does split-K. `cp.async` on B alone costs 6.5%, which is why v7 copies
+A Stream-K on v7's last wave reaches 106.7% on the mean, ahead on 21 of 25, and
+103.0% at n=4096, but it needs a workspace and a second kernel on a second
+stream, so it stays out of the library, in
+[`experiments/stream-k/`](experiments/stream-k/). Split-K does not ship either. `cp.async` on B alone costs 6.5%, which is why v7 copies
 both operands.
 
 ## Attention
@@ -178,4 +180,5 @@ benchmarks/     GFLOP/s, v1/v2/v3 vs cuBLAS, fusion, softmax, attention benchmar
 tests/          correctness vs the CPU oracle (gemm, softmax, attention)
 docs/           the detailed write-up: methodology, GEMM steps, wave
                 quantization, attention
+experiments/    stream-k, kept out of the library
 ```

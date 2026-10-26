@@ -36,7 +36,7 @@ and active warps to 21%, but `long_scoreboard` sits at 0.09% and `not_selected`
 at 49%, which says the scheduler has more eligible warps than issue slots, so no
 latency is being missed and nothing done to the inner loop can move that size.
 
-## The fix exists, was built, and is not here
+## The fix exists, and stays out of the library
 
 The standard answer is Stream-K: count the work in K-loop iterations rather than
 output tiles, launch a fixed number of blocks, and give each an equal slice, so a
@@ -61,6 +61,12 @@ else, since only those three sit below 75% efficiency. None crosses 100%, so the
 count stays at 12 of 25. Against that, two more kernels and a device workspace
 every caller would have to allocate, since the API takes pointers and nothing
 else. So neither ships.
+
+Stream-K pays once it only takes the last wave, in a second kernel, and leaves
+the full waves to v7 untouched: the register cost then stays in that kernel.
+That version takes the 25-size mean from 102.4% to 106.7% of cuBLAS and n=1152
+to 100%. It still needs the workspace, so it is in
+[`experiments/stream-k/`](../experiments/stream-k/).
 
 ## A second tile, chosen by the same model
 
