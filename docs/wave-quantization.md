@@ -4,8 +4,10 @@
 
 v6 swings between 12 500 and 20 500 GFLOP/s across the sweep, and the low points
 read as a weak kernel. The whole curve is wave quantization, and the quantum is
-the SM rather than the 2-blocks/SM wave: 68 blocks run at a time, so the
-makespan is `ceil(blocks/68)` block-times while the work is `blocks/68`.
+the SM rather than the 2-blocks/SM wave. An SM can hold two blocks, but two
+blocks on one SM take about as long as two in a row, as the fit below confirms,
+so the SMs that get one block more set the time: the makespan is
+`ceil(blocks/68)` block-times while the work is `blocks/68`.
 
     efficiency = (blocks/68) / ceil(blocks/68),  blocks = (M/128)·(N/128)
     throughput = efficiency × plateau

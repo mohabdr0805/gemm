@@ -86,11 +86,10 @@ marked `__restrict` under `#pragma omp simd`.
 
 CPU tiled is ~214× the naive version at n=1024 (same n on both sides) and reaches
 ~200 GFLOP/s from n=2048 on, about 15% of the 12700F's AVX2 peak, with no cache
-cliff. The three-level blocking explains it: at any instant a thread touches only
-three 64×64 sub-blocks (3 × 16 KB, L1-resident at any n), so growing n only adds
-bandwidth pressure from panel re-streaming: 172 GFLOP/s at n=6144, 154 at
-n=8192 (about −10% once twenty threads' panel re-reads hit the shared 25 MB
-L3).
+cliff. The blocking explains it: at any instant a thread touches only three 64×64
+sub-blocks, 3 × 16 KB whatever n is, so growing n adds pressure from panel
+re-streaming and no cliff: 172 GFLOP/s at n=6144, 154 at n=8192, −22% from
+n=4096 as twenty threads lean on the shared 25 MB L3.
 
 ## GPU v1 — `gemm_kernel`
 
@@ -124,7 +123,7 @@ raise arithmetic intensity, which is worth more than occupancy at this point.
 | v3     | 130 (0 spill)    | 16384 B      | 17% (1 block/SM)   | 15 451           |
 | v4     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 15 797           |
 | v5     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 17 926           |
-| v6     | 128 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 18 472           |
+| v6     | 126 (0 spill)    | 16384 B      | 33% (2 blocks/SM)  | 18 472           |
 
 Occupancy falls 100% → 33% → 17% down the first three rows while throughput
 rises 1 420 → 12 052 → 15 451. v1 sits at 100% theoretical occupancy yet runs
@@ -317,10 +316,10 @@ The disassembly agrees, which is the useful check on that ratio. `cuobjdump
 narrower shared load in either: the instruction mix is identical, so the whole
 v6 gain is wavefronts per instruction and not instructions.
 
-It costs nothing to get there: the same 128 registers as v5, the same 16 KB of
-shared, the same 33% occupancy. That 128 is a ceiling rather than a round
-number: 65 536 registers per SM over 512 threads is exactly 128 each, so one
-more would drop v6 to one block per SM the way v3's 130 does.
+It costs nothing to get there: 126 registers against v5's 128, the same 16 KB
+of shared, the same 33% occupancy. Two blocks per SM allow 128 (65 536 registers
+over 512 threads), so v6 sits two under the cliff that drops v3's 130 to one
+block per SM.
 
 Nsight Compute reports v6 and v5 within 0.3% of each other where the benchmark
 shows 5%: it profiles one launch in isolation, at base clocks, with caches
