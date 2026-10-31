@@ -371,9 +371,14 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev));
     if (major < 8) { std::printf("needs sm_80 or newer\n"); return 1; }
 
+    // Inputs rotate, per NVIDIA's GEMM measurement guidelines: at least two
+    // copies, enough to cover twice the L2 at the smallest size.
     const size_t szmax = (size_t)4096 * 4096 * sizeof(float);
-    float *A, *B, *C;
-    CUDA_CHECK(cudaMalloc(&A, szmax)); CUDA_CHECK(cudaMalloc(&B, szmax)); CUDA_CHECK(cudaMalloc(&C, szmax));
+    const int k = std::max(2, bench::rotation_copies(2 * (size_t)1024 * 1024 * sizeof(float)));
+    std::vector<float*> A(k), B(k), C(k);
+    for (int i = 0; i < k; ++i) {
+        CUDA_CHECK(cudaMalloc(&A[i], szmax)); CUDA_CHECK(cudaMalloc(&B[i], szmax)); CUDA_CHECK(cudaMalloc(&C[i], szmax));
+    }
     cublasHandle_t h;
     CUBLAS_CHECK(cublasCreate(&h));
     const float al = 1.0f, be = 0.0f;
@@ -384,24 +389,26 @@ int main(int argc, char** argv) {
         const size_t ne = (size_t)n * n;
         std::vector<float> hA(ne), hB(ne), ref(ne), out(ne);
         std::mt19937 rng(n);
-        std::uniform_real_distribution<float> d(-0.5f, 0.5f);
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
         for (auto& x : hA) x = d(rng);
         for (auto& x : hB) x = d(rng);
-        CUDA_CHECK(cudaMemcpy(A, hA.data(), ne * 4, cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(B, hB.data(), ne * 4, cudaMemcpyHostToDevice));
-        auto cub = [&] { CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &al, B, n, A, n, &be, C, n)); };
-        auto v7  = [&] { run_v7(n, al, A, B, be, C, sm, major); };
-        auto skf = [&] { run_streamk(n, al, A, B, be, C, sm, major); };
+        for (int i = 0; i < k; ++i) {
+            CUDA_CHECK(cudaMemcpy(A[i], hA.data(), ne * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(B[i], hB.data(), ne * 4, cudaMemcpyHostToDevice));
+        }
+        auto cub = [&](int i) { i %= k; CUBLAS_CHECK(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &al, B[i], n, A[i], n, &be, C[i], n)); };
+        auto v7  = [&](int i) { i %= k; run_v7(n, al, A[i], B[i], be, C[i], sm, major); };
+        auto skf = [&](int i) { i %= k; run_streamk(n, al, A[i], B[i], be, C[i], sm, major); };
 
-        cub(); CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(ref.data(), C, ne * 4, cudaMemcpyDeviceToHost));
+        cub(0); CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(ref.data(), C[0], ne * 4, cudaMemcpyDeviceToHost));
         double err = 0.0;
         for (int rep = 0; rep < 3; ++rep) {   // repeated, so stale flags would show
-            CUDA_CHECK(cudaMemset(C, 0xFF, ne * 4));   // NaN: an unwritten output fails
-            skf();
+            CUDA_CHECK(cudaMemset(C[0], 0xFF, ne * 4));   // NaN: an unwritten output fails
+            skf(0);
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
-            CUDA_CHECK(cudaMemcpy(out.data(), C, ne * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(out.data(), C[0], ne * 4, cudaMemcpyDeviceToHost));
             for (size_t i = 0; i < ne; ++i) {
                 const double e = std::fabs((double)out[i] - ref[i]);
                 if (!(e <= err)) err = std::isnan(e) ? std::numeric_limits<double>::infinity() : e;
