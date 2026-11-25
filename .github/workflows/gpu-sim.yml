@@ -1,0 +1,83 @@
+name: GPU tests (simulated)
+
+# Optional, non-required check. The hosted runners have no GPU, so the CUDA
+# tests cannot run in the normal CI jobs (the cuda-compile job only builds).
+# This runs the correctness, softmax and attention tests on a simulated NVIDIA
+# H100 provided by PantheonSim (https://github.com/pantheongpu/pantheonsim).
+# A simulator cannot reproduce hardware-specific behaviour or timing, so it
+# complements real-GPU testing and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-sim-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu-tests:
+    name: Tests on a simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # 90-virtual embeds PTX only (the simulator JIT-compiles PTX) and the
+      # shared CUDA runtime is required by the simulator.
+      - name: Configure (USE_CUDA=ON)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGEMM_NATIVE=OFF \
+            -DUSE_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+
+      - name: Build the tests
+        run: |
+          vgpu run --preload cmake --build build -j3 \
+            --target test_correctness test_softmax test_attention
+
+      # Each test prints OK on success, FAIL on any failure. The job fails if
+      # an OK summary or the simulated device line is missing, if a FAIL line,
+      # a skip or a simulator error shows up, or if ctest reports a failure.
+      - name: Run the tests
+        run: |
+          set -o pipefail
+          status=0
+          vgpu run ctest --test-dir build --no-tests=error \
+            --timeout 3000 --output-on-failure -V 2>&1 | tee ctest.log || status=1
+          grep -q 'virtual GPU platform initialized: 1 x nvidia/h100' ctest.log \
+            || { echo "no simulated device line"; status=1; }
+          grep -q '100% tests passed, 0 tests failed out of 3' ctest.log \
+            || { echo "ctest did not pass 3 of 3"; status=1; }
+          oks=$(grep -Ec '^[0-9]+: OK$' ctest.log || true)
+          echo "OK summaries: $oks"
+          [ "$oks" -eq 3 ] || { echo "expected 3 OK summaries"; status=1; }
+          for t in 'cuda  vs naive' 'reg   vs naive' 'v3 fb vs naive' 'v3 aligned' \
+                   'cublas vs naive' 'fused' 'softmax gpu vs oracle' 'softmax online vs oracle' \
+                   'vs oracle  M='; do
+            grep -q "$t" ctest.log || { echo "missing GPU check: $t"; status=1; }
+          done
+          if grep -Eq '(^|[^A-Za-z])FAIL|Not Run|Skipped|SKIP|VirtualGPU error|CUDA error|no CUDA device|no device' ctest.log; then
+            echo "failed test, skip, or device error"; status=1
+          fi
+          exit $status
